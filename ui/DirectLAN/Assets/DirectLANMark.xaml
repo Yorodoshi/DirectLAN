@@ -1,0 +1,26 @@
+<DrawingImage xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+  <DrawingImage.Drawing>
+    <DrawingGroup>
+      <GeometryDrawing Brush="Transparent" Geometry="M0,0 H256 V256 H0 Z"/>
+      <GeometryDrawing Geometry="M64,12 H192 Q244,12 244,64 V192 Q244,244 192,244 H64 Q12,244 12,192 V64 Q12,12 64,12 Z">
+        <GeometryDrawing.Brush>
+          <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+            <GradientStop Color="#244F86" Offset="0"/>
+            <GradientStop Color="#122D53" Offset="0.52"/>
+            <GradientStop Color="#0A1830" Offset="1"/>
+          </LinearGradientBrush>
+        </GeometryDrawing.Brush>
+        <GeometryDrawing.Pen><Pen Brush="#4C7DB4" Thickness="2"/></GeometryDrawing.Pen>
+      </GeometryDrawing>
+      <GeometryDrawing Geometry="M128,38 L206,70 V126 C206,175 175,208 128,229 C81,208 50,175 50,126 V70 Z" Brush="#1D4673">
+        <GeometryDrawing.Pen><Pen Brush="#74DFF8" Thickness="7" LineJoin="Round"/></GeometryDrawing.Pen>
+      </GeometryDrawing>
+      <GeometryDrawing Geometry="M128,87 L86,155 H170 Z">
+        <GeometryDrawing.Pen><Pen Brush="#60BFFC" Thickness="10" StartLineCap="Round" EndLineCap="Round" LineJoin="Round"/></GeometryDrawing.Pen>
+      </GeometryDrawing>
+      <GeometryDrawing Brush="#EEF9FF" Geometry="M146,87 A18,18 0 1 1 110,87 A18,18 0 1 1 146,87"/>
+      <GeometryDrawing Brush="#73E7F8" Geometry="M104,155 A18,18 0 1 1 68,155 A18,18 0 1 1 104,155"/>
+      <GeometryDrawing Brush="#73E7F8" Geometry="M188,155 A18,18 0 1 1 152,155 A18,18 0 1 1 188,155"/>
+    </DrawingGroup>
+  </DrawingImage.Drawing>
+</DrawingImage>

@@ -1,0 +1,75 @@
+<Window x:Class="DirectLAN.Launcher.PeerWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="DirectLAN · прямая сеть" Width="730" Height="650" MinWidth="610" MinHeight="500"
+        WindowStartupLocation="CenterScreen" Background="#0B1220" Foreground="#E6EDF7" FontFamily="Segoe UI" FontSize="14">
+  <Window.Resources>
+    <SolidColorBrush x:Key="PrimaryActionBrush" Color="#2F73C7"/>
+    <Style TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/></Style>
+    <Style TargetType="Button"><Setter Property="Padding" Value="13,8"/><Setter Property="Margin" Value="0,0,10,8"/></Style>
+    <Style TargetType="CheckBox"><Setter Property="Foreground" Value="#E6EDF7"/><Setter Property="Margin" Value="0,0,0,10"/></Style>
+  </Window.Resources>
+  <Grid Margin="25">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <StackPanel Margin="0,0,0,18">
+      <TextBlock Text="DirectLAN" FontSize="29" FontWeight="Bold"/>
+      <TextBlock Text="Два ПК в одной виртуальной сети через прямой WireGuard" Foreground="#ABC1D9" Margin="0,4,0,0"/>
+    </StackPanel>
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+      <StackPanel>
+        <Border Background="#172740" CornerRadius="8" Padding="16" Margin="0,0,0,16">
+          <StackPanel>
+            <DockPanel>
+              <Ellipse x:Name="StateDot" Width="11" Height="11" Fill="#8091A7" Margin="0,0,9,0" VerticalAlignment="Center" DockPanel.Dock="Left"/>
+              <TextBlock x:Name="StateTitle" Text="Начните с одного ПК" FontSize="19" FontWeight="SemiBold"/>
+            </DockPanel>
+            <TextBlock x:Name="Detail" Text="На первом ПК создайте приглашение. На втором вставьте его, затем верните ответ на первый ПК." Margin="0,8,0,0"/>
+            <TextBlock x:Name="Discovery" Foreground="#ABC1D9" Margin="0,7,0,0"/>
+          </StackPanel>
+        </Border>
+        <StackPanel x:Name="SetupPanel">
+          <WrapPanel>
+            <Button Content="Создать приглашение" Click="Create" Background="#2F73C7" Foreground="White"/>
+            <Button Content="Вставить приглашение" Click="Join"/>
+          </WrapPanel>
+          <TextBlock Text="DirectLAN сам выбирает IP и UDP-порт. Для запуска сетевой службы подтвердите запрос Windows." Foreground="#ABC1D9" Margin="0,3,0,13"/>
+          <Expander Header="Дополнительные разрешения" Foreground="#E6EDF7">
+            <StackPanel Margin="12,10,0,0">
+              <CheckBox x:Name="Router" Content="Запрашивать временный UDP-порт у роутера" IsChecked="True"/>
+              <CheckBox x:Name="Firewall" Content="Разрешить входящий UDP для DirectLAN в Windows" IsChecked="True"/>
+              <CheckBox x:Name="StunDiscovery" Content="Узнавать внешний IP и порт через STUN Cloudflare или Google" IsChecked="True"/>
+            </StackPanel>
+          </Expander>
+        </StackPanel>
+        <StackPanel x:Name="PairPanel" Visibility="Collapsed">
+          <TextBlock x:Name="Step" Margin="0,0,0,9"/>
+          <WrapPanel>
+            <Button x:Name="CopyCodeButton" Content="Скопировать код" Click="CopyCode" Background="{StaticResource PrimaryActionBrush}" Foreground="White"/>
+            <Button x:Name="AcceptButton" Content="Вставить ответ" Click="Accept"/>
+          </WrapPanel>
+          <Border Background="#132238" CornerRadius="8" Padding="14" Margin="0,4,0,9">
+            <DockPanel>
+              <Button x:Name="CheckButton" Content="Проверить сейчас" Click="CheckConnection" VerticalAlignment="Center" DockPanel.Dock="Right" Margin="12,0,0,0"/>
+              <StackPanel>
+                <TextBlock Text="Проверка связи" FontWeight="SemiBold" Margin="0,0,0,7"/>
+                <TextBlock x:Name="HandshakeStatus" Foreground="#ABC1D9"/>
+                <TextBlock x:Name="PingStatus" FontWeight="SemiBold" Margin="0,4,0,0"/>
+                <TextBlock x:Name="ProbeStatus" Foreground="#ABC1D9" Margin="0,4,0,0"/>
+              </StackPanel>
+            </DockPanel>
+          </Border>
+          <TextBlock x:Name="Addresses" Foreground="#ABC1D9" Margin="0,6,0,8"/>
+          <WrapPanel>
+            <Button x:Name="CopyIPButton" Content="Скопировать IP второго ПК" Click="CopyIP"/>
+            <Button Content="Забыть пару" Click="Reset"/>
+          </WrapPanel>
+        </StackPanel>
+        <TextBlock x:Name="Notice" Foreground="#F1BF75" Margin="0,8,0,0"/>
+      </StackPanel>
+    </ScrollViewer>
+    <StackPanel Grid.Row="2" Margin="0,12,0,0">
+      <ProgressBar x:Name="Progress" Height="3" IsIndeterminate="True" Visibility="Collapsed" Margin="0,0,0,10"/>
+      <TextBlock Text="Закрытие окна останавливает туннель. Пара сохраняется для следующего запуска." Foreground="#ABC1D9"/>
+    </StackPanel>
+  </Grid>
+</Window>
