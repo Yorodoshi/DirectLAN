@@ -57,6 +57,7 @@ type Tunnel struct {
 	device     *device.Device
 	bind       *icebind.Bind
 	direct     *stunBind
+	control    *controlTransport
 	interfaces DirectInterfaces
 	native     bool
 	port       uint16
@@ -232,6 +233,7 @@ func (t *Tunnel) Start() error {
 	var bind conn.Bind
 	if t.native {
 		t.direct = &stunBind{Bind: conn.NewDefaultBind(), interfaces: t.interfaces}
+		t.direct.control = t.control
 		if t.masked {
 			t.direct.mask = newUDPMask()
 		}
@@ -301,6 +303,9 @@ func (t *Tunnel) RemovePeer(peerID string) error {
 	}
 	p.route = nil
 	delete(t.peers, peerID)
+	if t.control != nil {
+		t.control.remove(peerID)
+	}
 	if t.direct != nil && t.direct.mask != nil {
 		t.direct.mask.remove(peerID)
 	}

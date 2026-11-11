@@ -22,6 +22,7 @@ type stunBind struct {
 	mu         sync.Mutex
 	pending    map[[stun.TransactionIDSize]byte]stunQuery
 	mask       *udpMask
+	control    *controlTransport
 }
 
 type stunQuery struct {
@@ -67,6 +68,8 @@ func (b *stunBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				packet := packets[i][:size]
 				if stun.IsMessage(packet) && packet[0] == 1 && packet[1] == 1 {
 					b.receiveSTUN(packet, endpoints[i])
+					sizes[i] = 0
+				} else if b.control != nil && b.control.receive(packet, endpoints[i]) {
 					sizes[i] = 0
 				} else if b.mask != nil {
 					id, size, err := b.mask.open(packet)

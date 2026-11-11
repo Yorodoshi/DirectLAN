@@ -16,9 +16,10 @@ import (
 func TestSTUNUsesWireGuardPort(t *testing.T) {
 	t.Run("legacy", func(t *testing.T) { testSTUNUsesWireGuardPort(t, nil) })
 	t.Run("masked", func(t *testing.T) { testSTUNUsesWireGuardPort(t, newUDPMask()) })
+	t.Run("control", func(t *testing.T) { testSTUNUsesWireGuardPort(t, newUDPMask(), newControlTransport()) })
 }
 
-func testSTUNUsesWireGuardPort(t *testing.T, mask *udpMask) {
+func testSTUNUsesWireGuardPort(t *testing.T, mask *udpMask, control ...*controlTransport) {
 	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -29,6 +30,9 @@ func testSTUNUsesWireGuardPort(t *testing.T, mask *udpMask) {
 	}
 
 	bind := &stunBind{Bind: conn.NewDefaultBind(), mask: mask}
+	if len(control) > 0 {
+		bind.control = control[0]
+	}
 	receivers, port, err := bind.Open(0)
 	if err != nil {
 		t.Fatal(err)

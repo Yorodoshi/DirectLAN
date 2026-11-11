@@ -40,6 +40,7 @@ func NewSecureDirect(privateKey []byte, ip net.IP, prefix *net.IPNet, port uint1
 		return nil, err
 	}
 	t.secureContext, t.masked = networkID, masked
+	t.control = newControlTransport()
 	if masked {
 		t.mtu = maskedMTU
 	}

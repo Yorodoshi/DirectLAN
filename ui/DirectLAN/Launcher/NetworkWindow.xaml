@@ -152,10 +152,16 @@
             <Button x:Name="ImportButton" Content="Вставить код участника" Click="ImportCode"/>
             <Button x:Name="CheckAllButton" Content="Проверить всех" Click="CheckAll"/>
           </WrapPanel>
+          <Border x:Name="ConfirmationPanel" Background="#18344D" BorderBrush="#39749B" BorderThickness="1" CornerRadius="8" Padding="13" Margin="0,2,0,10" Visibility="Collapsed">
+            <StackPanel>
+              <TextBlock Text="Подтверждение подключения" FontWeight="SemiBold" Margin="0,0,0,5"/>
+              <TextBlock x:Name="ConfirmationHint" Foreground="#C0D9EE"/>
+            </StackPanel>
+          </Border>
           <Expander x:Name="ConnectionHelp" Header="Как добавить компьютер" Foreground="#ABC1D9" Margin="0,2,0,12">
             <StackPanel Margin="13,9,0,0">
               <TextBlock x:Name="Step" Margin="0,0,0,8"/>
-              <TextBlock Text="После добавления или удаления участника владелец передаёт обновлённый код сети всем. Каждый вставляет его в DirectLAN, чтобы обновить состав и прямые соединения."/>
+              <TextBlock Text="Владелец подписывает обновлённый состав сети. DirectLAN передаёт его участникам автоматически. Если прямой UDP-путь недоступен, владелец может передать код сети через доверенную переписку."/>
             </StackPanel>
           </Expander>
           <DockPanel Margin="0,0,0,8">
@@ -193,15 +199,18 @@
         <Border x:Name="NoticePanel" Background="#172740" BorderBrush="#304A68" BorderThickness="1" CornerRadius="8" Padding="13" Margin="0,8,0,0" Visibility="Collapsed">
           <StackPanel>
             <TextBlock x:Name="Notice" Foreground="#F1BF75"/>
-            <Button x:Name="ShowLogButton" Content="Показать журнал" Click="ShowLog" HorizontalAlignment="Left" Margin="0,9,0,0" Visibility="Collapsed"/>
           </StackPanel>
         </Border>
       </StackPanel>
     </ScrollViewer>
     <StackPanel Grid.Row="2" Margin="0,12,0,0">
       <ProgressBar x:Name="Progress" Height="3" IsIndeterminate="True" Visibility="Collapsed" Margin="0,0,0,10"/>
-      <Button x:Name="CloseAllButton" Content="Закрыть все подключения DirectLAN" Click="CloseAllConnections" HorizontalAlignment="Left"
-              ToolTip="Штатно завершает сетевые службы DirectLAN этого пользователя на данном ПК, включая прежнюю пару."/>
+      <WrapPanel>
+        <Button x:Name="CloseAllButton" Content="Закрыть все подключения DirectLAN" Click="CloseAllConnections"
+                ToolTip="Штатно завершает сетевые службы DirectLAN этого пользователя на данном ПК, включая прежнюю пару."/>
+        <Button x:Name="ShowLogButton" Content="Журнал работы" Click="ShowLog" IsEnabled="False"
+                ToolTip="Открыть журнал текущего запуска DirectLAN."/>
+      </WrapPanel>
       <TextBlock Text="Закрытие окна останавливает локальные туннели. Сеть сохраняется для следующего запуска." Foreground="#ABC1D9"/>
     </StackPanel>
   </Grid>

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -41,35 +42,47 @@ type profile struct {
 }
 
 type memberStatus struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	IP            string    `json:"ip"`
-	State         string    `json:"state"`
-	RTT           float64   `json:"rtt_ms"`
-	LastProbe     time.Time `json:"last_probe,omitzero"`
-	LastHandshake time.Time `json:"last_handshake,omitzero"`
-	Checking      bool      `json:"checking"`
-	misses        int
+	ID                   string    `json:"id"`
+	Name                 string    `json:"name"`
+	IP                   string    `json:"ip"`
+	State                string    `json:"state"`
+	RTT                  float64   `json:"rtt_ms"`
+	LastProbe            time.Time `json:"last_probe,omitzero"`
+	LastHandshake        time.Time `json:"last_handshake,omitzero"`
+	Checking             bool      `json:"checking"`
+	AwaitingConfirmation bool      `json:"awaiting_confirmation"`
+	ProbeError           string    `json:"probe_error,omitempty"`
+	misses               int
 }
 
 type node struct {
-	mu         sync.Mutex
-	keys       identity.State
-	path       string
-	p          profile
-	roster     Code
-	wg         *tunnel.Tunnel
-	interfaces tunnel.DirectInterfaces
-	egress     string
-	endpoints  []netip.AddrPort
-	scanned    bool
-	discovery  string
-	detail     string
-	members    map[string]memberStatus
-	wake       chan struct{}
+	mu                   sync.Mutex
+	keys                 identity.State
+	path                 string
+	p                    profile
+	roster               Code
+	wg                   *tunnel.Tunnel
+	interfaces           tunnel.DirectInterfaces
+	egress               string
+	endpoints            []netip.AddrPort
+	scanned              bool
+	discovery            string
+	detail               string
+	members              map[string]memberStatus
+	wake                 chan struct{}
+	assembly             rosterAssembly
+	confirmed            map[string]uint64
+	lastTransfer         map[string]time.Time
+	challenge            [16]byte
+	ownerCookie          [16]byte
+	cookieSecret         [32]byte
+	controlAttempts      int
+	lastOwnerControl     time.Time
+	controlOwnerEndpoint netip.AddrPort
 }
 
 func Run(ctx context.Context, identityPath, uiSID string) error {
+	log.Printf("mesh event=service_started control_protocol=1")
 	keys, err := identity.LoadOrCreate(identityPath)
 	if err != nil {
 		return err
@@ -84,6 +97,7 @@ func Run(ctx context.Context, identityPath, uiSID string) error {
 			n.mu.Lock()
 			defer n.mu.Unlock()
 			if err := n.restore(); err != nil {
+				log.Printf("mesh event=restore_failed error=%q", err.Error())
 				n.detail = "Не удалось открыть сеть. " + err.Error()
 			}
 		})
@@ -162,9 +176,6 @@ func freeAddress(code Code) (netip.Addr, error) {
 
 func (n *node) open(p profile, code Code) (*tunnel.Tunnel, uint16, tunnel.DirectInterfaces, string, error) {
 	interfaces, egress := directpair.PhysicalInterfaces()
-	if p.Paused {
-		return nil, p.Port, interfaces, egress, nil
-	}
 	self, admitted := localMember(code, n.keys.IdentityPublic())
 	if admitted {
 		public, err := n.keys.WireGuardPublic()
@@ -173,6 +184,9 @@ func (n *node) open(p profile, code Code) (*tunnel.Tunnel, uint16, tunnel.Direct
 		}
 		p.LocalIP = self.IP
 	} else if !p.Pending {
+		return nil, p.Port, interfaces, egress, nil
+	}
+	if p.Paused {
 		return nil, p.Port, interfaces, egress, nil
 	}
 	if !p.LocalIP.Is4() || !code.Network.Contains(p.LocalIP) || p.LocalIP == code.Network.Addr() {
@@ -188,21 +202,28 @@ func (n *node) open(p profile, code Code) (*tunnel.Tunnel, uint16, tunnel.Direct
 		if err = wg.Start(); err != nil {
 			return nil, err
 		}
+		if p.Pending {
+			owner := code.Members[0]
+			if err = wg.ConfigureControlPeer(memberID(owner), owner.WireGuard, memberEndpoint(p, owner)); err != nil {
+				_ = wg.Stop()
+				return nil, err
+			}
+		}
 		if admitted {
 			for _, m := range code.Members {
 				if bytes.Equal(m.Identity, self.Identity) {
 					continue
 				}
-				ep := p.Learned[memberID(m)]
-				if !directpair.PublicEndpoint(ep) && len(m.Endpoints) != 0 {
-					ep = m.Endpoints[0]
-				}
-				if !directpair.PublicEndpoint(ep) {
-					ep = netip.AddrPort{}
-				}
+				ep := memberEndpoint(p, m)
 				if err = wg.AddSecureDirectPeer(memberID(m), m.WireGuard, m.IP.AsSlice(), ep); err != nil {
 					_ = wg.Stop()
 					return nil, err
+				}
+				if bytes.Equal(code.Owner, self.Identity) || bytes.Equal(m.Identity, code.Owner) {
+					if err = wg.ConfigureControlPeer(memberID(m), m.WireGuard, ep); err != nil {
+						_ = wg.Stop()
+						return nil, err
+					}
 				}
 			}
 		}
@@ -223,9 +244,28 @@ func (n *node) open(p profile, code Code) (*tunnel.Tunnel, uint16, tunnel.Direct
 	return wg, port, interfaces, egress, nil
 }
 
+func memberEndpoint(p profile, m Member) netip.AddrPort {
+	ep := p.Learned[memberID(m)]
+	if !directpair.PublicEndpoint(ep) && len(m.Endpoints) != 0 {
+		ep = m.Endpoints[0]
+	}
+	if !directpair.PublicEndpoint(ep) {
+		return netip.AddrPort{}
+	}
+	return ep
+}
+
 // Reconfigure as a transaction. A failed start or save restores the previous
 // signed roster and recreates its routes before returning an error.
 func (n *node) replace(p profile, code Code) error {
+	var challenge [16]byte
+	var secret [32]byte
+	if _, err := rand.Read(challenge[:]); err != nil {
+		return err
+	}
+	if _, err := rand.Read(secret[:]); err != nil {
+		return err
+	}
 	oldP, oldCode, oldWG := n.p, n.roster, n.wg
 	if oldWG != nil {
 		if err := oldWG.Stop(); err != nil {
@@ -265,17 +305,20 @@ func (n *node) replace(p profile, code Code) error {
 				return errors.Join(err, rollback)
 			}
 			n.p, n.endpoints, n.scanned = oldP, nil, false
+			n.resetControl(challenge, secret)
 			n.requestCheck()
 		}
 		return err
 	}
 	n.p, n.roster, n.wg, n.interfaces, n.egress = p, code, wg, interfaces, egress
 	n.members = make(map[string]memberStatus)
+	n.resetControl(challenge, secret)
 	n.endpoints, n.scanned, n.discovery, n.detail = nil, false, "Ищем внешний адрес…", ""
 	if wg == nil {
 		n.discovery = ""
 	}
 	n.requestCheck()
+	log.Printf("mesh event=network_loaded revision=%d members=%d pending=%t paused=%t", code.Revision, len(code.Members), p.Pending, p.Paused)
 	return nil
 }
 
@@ -376,7 +419,11 @@ func (n *node) accept(text string, code Code) error {
 		if err != nil {
 			return err
 		}
-		return n.replace(p, next)
+		if err = n.replace(p, next); err != nil {
+			return err
+		}
+		log.Printf("mesh event=member_approved peer=%s revision=%d members=%d", shortID(memberID(m)), next.Revision, len(next.Members))
+		return nil
 	}
 	if code.Kind != "network" {
 		return errors.New("здесь нужен обновлённый код сети от владельца")
@@ -385,6 +432,9 @@ func (n *node) accept(text string, code Code) error {
 		return errors.New("код сети устарел. Запросите свежий код у владельца")
 	}
 	if code.Revision == n.roster.Revision {
+		if n.p.Pending {
+			return errors.New("это прежнее приглашение. Нужен обновлённый код сети после принятия владельцем вашего запроса")
+		}
 		old, _ := json.Marshal(n.roster.Members)
 		current, _ := json.Marshal(code.Members)
 		if !bytes.Equal(old, current) {
@@ -396,9 +446,16 @@ func (n *node) accept(text string, code Code) error {
 		return errors.New("владелец ещё не принял ваш запрос")
 	}
 	p.Pending, p.Code = false, strings.TrimSpace(text)
+	if !n.p.Pending && n.wg != nil && sameAuthorizations(n.roster, code) {
+		return n.updateRosterMetadata(p, code)
+	}
 	// Fresh owner-approved endpoints supersede older learned addresses.
 	p.Learned = nil
-	return n.replace(p, code)
+	if err := n.replace(p, code); err != nil {
+		return err
+	}
+	log.Printf("mesh event=owner_roster_applied revision=%d members=%d", code.Revision, len(code.Members))
+	return nil
 }
 
 func cloneEndpoints(source map[string]netip.AddrPort) map[string]netip.AddrPort {
@@ -413,6 +470,9 @@ func (n *node) handle(_ context.Context, req localipc.Request) (any, *localipc.E
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	fail := func(err error) (any, *localipc.Error) {
+		if req.Method != "mesh.status" {
+			log.Printf("mesh event=command_failed method=%q error=%q", req.Method, err.Error())
+		}
 		return nil, &localipc.Error{Code: "MESH", Message: err.Error()}
 	}
 	var args struct {
@@ -576,6 +636,8 @@ func (n *node) handle(_ context.Context, req localipc.Request) (any, *localipc.E
 		n.p, n.roster, n.wg = profile{}, Code{}, nil
 		n.members, n.endpoints, n.scanned, n.detail = nil, nil, false, ""
 		n.discovery, n.egress, n.interfaces = "", "", tunnel.DirectInterfaces{}
+		n.resetControl([16]byte{}, [32]byte{})
+		n.requestCheck()
 		if stopErr != nil {
 			return fail(fmt.Errorf("профиль удалён, при остановке туннеля возникла ошибка: %w", stopErr))
 		}
@@ -592,7 +654,7 @@ func (n *node) status() any {
 		state = "waiting"
 		detail = "Добавляйте участников через запросы и обновлённый код владельца."
 		if n.p.Pending {
-			state, detail = "pending", "Скопируйте запрос владельцу. Затем вставьте обновлённый код сети с вашим допуском."
+			state, detail = "pending", "Передайте запрос владельцу. После принятия подписанный допуск придёт автоматически; обновлённый код можно вставить вручную."
 		}
 		if n.wg == nil {
 			state, detail = "revoked", "Этот ПК исключён из сети либо туннель остановлен."
@@ -604,6 +666,7 @@ func (n *node) status() any {
 		for _, m := range n.roster.Members {
 			s := n.members[memberID(m)]
 			s.ID, s.Name, s.IP = memberID(m), m.Name, m.IP.String()
+			s.AwaitingConfirmation = n.owner() && !bytes.Equal(m.Identity, n.keys.IdentityPublic()) && n.confirmed[memberID(m)] < n.roster.Revision
 			if bytes.Equal(m.Identity, n.keys.IdentityPublic()) {
 				s.State = "local"
 			} else if n.wg == nil || n.p.Paused {
@@ -646,11 +709,21 @@ func (n *node) monitor(ctx context.Context) {
 	var nextScan time.Time
 	var mapped netip.AddrPort
 	for {
+		n.mu.Lock()
+		current := n.wg
+		var control <-chan tunnel.ControlMessage
+		if current != nil {
+			control = current.ControlMessages()
+		}
+		n.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		case <-n.wake:
+		case message := <-control:
+			n.handleControl(current, message)
+			continue
 		}
 		n.mu.Lock()
 		wg, p, interfaces := n.wg, n.p, n.interfaces
@@ -669,9 +742,11 @@ func (n *node) monitor(ctx context.Context) {
 			n.mu.Lock()
 			if n.wg == wg {
 				n.endpoints, n.discovery, n.scanned = endpoints, detail, true
+				log.Printf("mesh event=discovery endpoints=%d router_mapping=%t", len(endpoints), lease.IsValid())
 			}
 			n.mu.Unlock()
 		}
+		n.sendHello()
 		n.mu.Lock()
 		if n.wg != wg || n.p.Pending {
 			n.mu.Unlock()
@@ -706,7 +781,11 @@ func (n *node) monitor(ctx context.Context) {
 					s.LastHandshake = stats.LastHandshake
 				}
 				if err == nil {
+					if s.State != "connected" {
+						log.Printf("mesh event=tunnel_connected peer=%s rtt_ms=%.1f", shortID(memberID(m)), float64(probe.RTT)/float64(time.Millisecond))
+					}
 					s.State, s.RTT, s.misses = "connected", float64(probe.RTT)/float64(time.Millisecond), 0
+					s.ProbeError = ""
 					ep, parse := netip.ParseAddrPort(stats.Endpoint)
 					if parse == nil && directpair.PublicEndpoint(ep) && n.p.Learned[memberID(m)] != ep {
 						p := n.p
@@ -719,6 +798,10 @@ func (n *node) monitor(ctx context.Context) {
 				} else {
 					s.State, s.RTT = "connecting", 0
 					s.misses++
+					s.ProbeError = "Нет ответа внутри туннеля; проверьте допуск и доступность UDP."
+					if s.misses == 1 || s.misses == 3 || s.misses%12 == 0 {
+						log.Printf("mesh event=probe_failed peer=%s attempts=%d handshake=%t", shortID(memberID(m)), s.misses, !s.LastHandshake.IsZero())
+					}
 					if s.misses >= 3 && len(m.Endpoints) > 0 {
 						_ = wg.SetDirectEndpoint(memberID(m), m.Endpoints[(s.misses-3)%len(m.Endpoints)])
 					}
