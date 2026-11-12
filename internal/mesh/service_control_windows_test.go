@@ -4,6 +4,7 @@ package mesh
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"net/netip"
@@ -11,9 +12,97 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"directlan/internal/identity"
+	"directlan/internal/localipc"
+	"directlan/internal/tunnel"
 )
+
+func TestCopyNetworkCodeKeepsRevisionAndAcknowledgements(t *testing.T) {
+	keys, code, text := lifecycleNetwork(t)
+	n := node{keys: keys, roster: code, p: profile{Code: text, LocalIP: code.Members[0].IP},
+		path: filepath.Join(t.TempDir(), "owner.mesh.json"), wg: &tunnel.Tunnel{}, scanned: true,
+		endpoints: append([]netip.AddrPort(nil), code.Members[0].Endpoints...),
+		confirmed: map[string]uint64{memberID(code.Members[1]): code.Revision}}
+	if err := n.save(n.p); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(n.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		result, apiErr := n.handle(context.Background(), localipc.Request{Method: "mesh.code"})
+		if apiErr != nil {
+			t.Fatal(apiErr)
+		}
+		if result.(map[string]string)["code"] != text || n.roster.Revision != code.Revision || n.confirmed[memberID(code.Members[1])] != code.Revision {
+			t.Fatal("copying an unchanged invitation changed its revision or acknowledgement")
+		}
+	}
+	after, err := os.ReadFile(n.path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("copying an unchanged code rewrote its saved profile: %v", err)
+	}
+}
+
+func TestCopyNetworkCodeRefreshesOnlyChangedMetadataOrExpiry(t *testing.T) {
+	for _, change := range []string{"endpoint", "expiry"} {
+		t.Run(change, func(t *testing.T) {
+			keys, code, text := lifecycleNetwork(t)
+			endpoints := append([]netip.AddrPort(nil), code.Members[0].Endpoints...)
+			if change == "endpoint" {
+				endpoints = []netip.AddrPort{netip.MustParseAddrPort("1.1.1.1:50003")}
+			} else {
+				code.Expires = time.Now().Add(4 * time.Minute)
+				var err error
+				text, err = Encode(code, ed25519.PrivateKey(keys.IdentityPrivate))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			n := node{keys: keys, roster: code, p: profile{Code: text, LocalIP: code.Members[0].IP},
+				path: filepath.Join(t.TempDir(), "owner.mesh.json"), wg: &tunnel.Tunnel{}, scanned: true, endpoints: endpoints}
+			result, apiErr := n.handle(context.Background(), localipc.Request{Method: "mesh.code"})
+			if apiErr != nil {
+				t.Fatal(apiErr)
+			}
+			refreshed := result.(map[string]string)["code"]
+			if n.roster.Revision != code.Revision+1 || refreshed == text {
+				t.Fatal("changed metadata was not signed with one new revision")
+			}
+			if _, err := Decode(refreshed, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			for range 3 {
+				result, apiErr = n.handle(context.Background(), localipc.Request{Method: "mesh.code"})
+				if apiErr != nil || result.(map[string]string)["code"] != refreshed || n.roster.Revision != code.Revision+1 {
+					t.Fatal("repeated copy kept incrementing an already refreshed revision")
+				}
+			}
+		})
+	}
+}
+
+func TestAuthenticatedControlSourceFreshnessRefreshesAndResets(t *testing.T) {
+	n := node{}
+	now := time.Unix(1800000000, 0)
+	endpoint := netip.MustParseAddrPort("8.8.8.8:50001")
+	n.rememberControlEndpoint("member", endpoint, now.Add(-time.Minute))
+	n.rememberControlEndpoint("member", endpoint, now)
+	if !n.controlSources["member"].fresh(now.Add(44 * time.Second)) {
+		t.Fatal("repeat authenticated response did not refresh source freshness")
+	}
+	n.rememberControlEndpoint("private", netip.MustParseAddrPort("192.168.1.2:50002"), now)
+	if _, ok := n.controlSources["private"]; ok {
+		t.Fatal("private source became an approved public fallback")
+	}
+	n.resetControl([16]byte{1}, [32]byte{2})
+	if len(n.controlSources) != 0 {
+		t.Fatal("new tunnel kept return-path evidence from a previous tunnel")
+	}
+}
 
 func pendingAdmissionNode(t *testing.T) (*node, Code, ed25519.PrivateKey) {
 	t.Helper()

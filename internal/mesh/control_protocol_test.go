@@ -6,7 +6,41 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestEndpointFallbackPreservesFreshAuthenticatedSource(t *testing.T) {
+	now := time.Unix(1800000000, 0)
+	learned := netip.MustParseAddrPort("8.8.8.8:50001")
+	signed := netip.MustParseAddrPort("1.1.1.1:50002")
+	source := authenticatedEndpoint{endpoint: learned, observed: now.Add(-44 * time.Second)}
+	if _, rotate := peerEndpointCandidate(source, learned, []netip.AddrPort{signed}, 12, now); rotate {
+		t.Fatal("probe failure replaced a recently authenticated source with a signed candidate")
+	}
+	source.observed = now.Add(-authenticatedEndpointTTL)
+	for _, check := range []struct {
+		misses int
+		want   netip.AddrPort
+		rotate bool
+	}{
+		{2, netip.AddrPort{}, false},
+		{3, learned, true},
+		{4, signed, true},
+		{5, learned, true},
+	} {
+		got, rotate := peerEndpointCandidate(source, learned, []netip.AddrPort{learned, {}, signed, signed}, check.misses, now)
+		if got != check.want || rotate != check.rotate {
+			t.Errorf("misses=%d selected %v, %t; want %v, %t", check.misses, got, rotate, check.want, check.rotate)
+		}
+	}
+	if _, rotate := peerEndpointCandidate(authenticatedEndpoint{}, netip.AddrPort{}, nil, 3, now); rotate {
+		t.Fatal("selected an unavailable fallback")
+	}
+	source.observed = now.Add(time.Second)
+	if source.fresh(now) {
+		t.Fatal("a future timestamp kept a source fresh across a clock rollback")
+	}
+}
 
 func TestControlCandidatesPreferLearnedAndRemoveInvalidDuplicates(t *testing.T) {
 	learned := netip.MustParseAddrPort("8.8.8.8:50001")

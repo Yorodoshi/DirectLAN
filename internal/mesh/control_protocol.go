@@ -5,7 +5,32 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"net/netip"
+	"time"
 )
+
+const authenticatedEndpointTTL = 45 * time.Second
+
+type authenticatedEndpoint struct {
+	endpoint netip.AddrPort
+	observed time.Time
+}
+
+func (source authenticatedEndpoint) fresh(now time.Time) bool {
+	return source.endpoint.IsValid() && !source.observed.IsZero() && !now.Before(source.observed) && now.Sub(source.observed) < authenticatedEndpointTTL
+}
+
+// A failed application probe does not invalidate a recently authenticated UDP
+// path. Once that evidence expires, try learned and signed addresses in order.
+func peerEndpointCandidate(source authenticatedEndpoint, learned netip.AddrPort, signed []netip.AddrPort, misses int, now time.Time) (netip.AddrPort, bool) {
+	if misses < 3 || source.fresh(now) {
+		return netip.AddrPort{}, false
+	}
+	candidates := controlCandidates(learned, signed)
+	if len(candidates) == 0 {
+		return netip.AddrPort{}, false
+	}
+	return candidates[(misses-3)%len(candidates)], true
+}
 
 func sameAuthorizations(a, b Code) bool {
 	if len(a.Members) != len(b.Members) {

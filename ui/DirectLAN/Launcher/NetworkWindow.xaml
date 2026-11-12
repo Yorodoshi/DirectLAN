@@ -152,12 +152,7 @@
             <Button x:Name="ImportButton" Content="Вставить код участника" Click="ImportCode"/>
             <Button x:Name="CheckAllButton" Content="Проверить всех" Click="CheckAll"/>
           </WrapPanel>
-          <Border x:Name="ConfirmationPanel" Background="#18344D" BorderBrush="#39749B" BorderThickness="1" CornerRadius="8" Padding="13" Margin="0,2,0,10" Visibility="Collapsed">
-            <StackPanel>
-              <TextBlock Text="Подтверждение подключения" FontWeight="SemiBold" Margin="0,0,0,5"/>
-              <TextBlock x:Name="ConfirmationHint" Foreground="#C0D9EE"/>
-            </StackPanel>
-          </Border>
+          <TextBlock x:Name="RosterSyncStatus" Foreground="#D4BA88" Margin="0,0,0,10" Visibility="Collapsed"/>
           <Expander x:Name="ConnectionHelp" Header="Как добавить компьютер" Foreground="#ABC1D9" Margin="0,2,0,12">
             <StackPanel Margin="13,9,0,0">
               <TextBlock x:Name="Step" Margin="0,0,0,8"/>
@@ -174,15 +169,18 @@
           <DataGrid x:Name="MembersGrid" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" CanUserDeleteRows="False"
                     CanUserResizeRows="False" CanUserSortColumns="False" HeadersVisibility="Column" GridLinesVisibility="None"
                     SelectionMode="Single" SelectionUnit="FullRow" SelectionChanged="SelectMember" RowHeaderWidth="0" AlternationCount="2"
-                    Background="#132238" BorderThickness="0" MinHeight="120" MaxHeight="275" Margin="0,0,0,10">
+                    Background="#132238" BorderThickness="0" MinHeight="90" MaxHeight="275" Margin="0,0,0,10">
             <DataGrid.Columns>
               <DataGridTextColumn Header="Компьютер" Binding="{Binding Name}" Width="*" MinWidth="150"/>
               <DataGridTextColumn Header="Виртуальный IP" Binding="{Binding IP}" Width="135"/>
               <DataGridTemplateColumn Header="Соединение" Width="165">
                 <DataGridTemplateColumn.CellTemplate><DataTemplate>
-                  <StackPanel Orientation="Horizontal">
-                    <Ellipse Width="8" Height="8" Fill="{Binding StateBrush}" Margin="0,0,7,0" VerticalAlignment="Center"/>
-                    <TextBlock Text="{Binding StateText}" TextWrapping="NoWrap"/>
+                  <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                      <Ellipse Width="8" Height="8" Fill="{Binding StateBrush}" Margin="0,0,7,0" VerticalAlignment="Center"/>
+                      <TextBlock Text="{Binding StateText}" TextWrapping="NoWrap"/>
+                    </StackPanel>
+                    <TextBlock Text="Обновляется состав" FontSize="11" Foreground="#D4BA88" Margin="15,3,0,0" Visibility="{Binding RosterSyncVisibility}" TextWrapping="NoWrap"/>
                   </StackPanel>
                 </DataTemplate></DataGridTemplateColumn.CellTemplate>
               </DataGridTemplateColumn>
@@ -195,6 +193,12 @@
             <Button x:Name="CheckSelectedButton" Content="Проверить участника" Click="CheckSelected" IsEnabled="False"/>
             <Button x:Name="RemoveButton" Content="Удалить участника" Click="RemoveMember" IsEnabled="False"/>
           </WrapPanel>
+          <Border x:Name="ConfirmationPanel" Background="#18344D" BorderBrush="#39749B" BorderThickness="1" CornerRadius="8" Padding="13" Margin="0,2,0,10" Visibility="Collapsed">
+            <StackPanel>
+              <TextBlock x:Name="ConfirmationTitle" Text="Подтверждение подключения" FontWeight="SemiBold" Margin="0,0,0,5"/>
+              <TextBlock x:Name="ConfirmationHint" Foreground="#C0D9EE"/>
+            </StackPanel>
+          </Border>
         </StackPanel>
         <Border x:Name="NoticePanel" Background="#172740" BorderBrush="#304A68" BorderThickness="1" CornerRadius="8" Padding="13" Margin="0,8,0,0" Visibility="Collapsed">
           <StackPanel>
@@ -210,6 +214,8 @@
                 ToolTip="Штатно завершает сетевые службы DirectLAN этого пользователя на данном ПК, включая прежнюю пару."/>
         <Button x:Name="ShowLogButton" Content="Журнал работы" Click="ShowLog" IsEnabled="False"
                 ToolTip="Открыть журнал текущего запуска DirectLAN."/>
+        <Button x:Name="CopyLogButton" Content="Скопировать журнал" Click="CopyLog" IsEnabled="False"
+                ToolTip="Скопировать последние 120 строк журнала, версию приложения и время UTC."/>
       </WrapPanel>
       <TextBlock Text="Закрытие окна останавливает локальные туннели. Сеть сохраняется для следующего запуска." Foreground="#ABC1D9"/>
     </StackPanel>

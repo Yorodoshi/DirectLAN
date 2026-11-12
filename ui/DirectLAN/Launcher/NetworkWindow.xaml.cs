@@ -260,6 +260,35 @@ public partial class NetworkWindow : Window
         catch (Exception ex) when (ex is IOException or Win32Exception) { SetNotice(ex.Message, error: true); }
     }
 
+    private async void CopyLog(object sender, RoutedEventArgs e) => await RunAsync(async () =>
+    {
+        if (_runPath is null || !File.Exists(Path.ChangeExtension(_runPath, ".log")))
+            throw new IOException("Журнал текущего запуска пока не найден. Запустите сеть и повторите попытку.");
+        var logPath = Path.ChangeExtension(_runPath, ".log");
+        var snapshot = await Task.Run(() => ReadLogSnapshot(logPath));
+        for (var attempt = 0; ; attempt++)
+        {
+            try { Clipboard.SetText(snapshot); break; }
+            catch (ExternalException) when (attempt < 3) { await Task.Delay(80); }
+        }
+        SetNotice("Журнал скопирован. Нажмите Ctrl+V, чтобы вставить его в сообщение.");
+    });
+
+    private static string ReadLogSnapshot(string logPath)
+    {
+        using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        var lines = new Queue<string>(120);
+        while (reader.ReadLine() is { } line)
+        {
+            if (lines.Count == 120) lines.Dequeue();
+            lines.Enqueue(line);
+        }
+        var version = typeof(NetworkWindow).Assembly.GetName().Version?.ToString(3) ?? "неизвестна";
+        return $"DirectLAN {version}{Environment.NewLine}Скопировано: {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC{Environment.NewLine}{Environment.NewLine}"
+            + string.Join(Environment.NewLine, lines);
+    }
+
     private void SetNotice(string message, bool error = false)
     {
         var logMarker = message.IndexOf("Журнал:", StringComparison.Ordinal);
@@ -267,7 +296,7 @@ public partial class NetworkWindow : Window
         NoticePanel.Visibility = string.IsNullOrWhiteSpace(Notice.Text) ? Visibility.Collapsed : Visibility.Visible;
         NoticePanel.Background = error ? new SolidColorBrush(Color.FromRgb(57, 34, 37)) : (Brush)FindResource("StatusNoticeBrush");
         Notice.Foreground = error ? Brushes.LightSalmon : new SolidColorBrush(Color.FromRgb(171, 193, 217));
-        ShowLogButton.IsEnabled = _runPath is not null && File.Exists(Path.ChangeExtension(_runPath, ".log"));
+        ShowLogButton.IsEnabled = CopyLogButton.IsEnabled = _runPath is not null && File.Exists(Path.ChangeExtension(_runPath, ".log"));
     }
 
     private async void RemoveMember(object sender, RoutedEventArgs e)
@@ -368,8 +397,9 @@ public partial class NetworkWindow : Window
         var active = _state.State != "idle" || _state.Pending || _state.IsOwner;
         _hasSavedNetwork = active;
         var members = _state.Members.Where(member => member.IP != _state.LocalIP && member.State != "local").ToList();
-        var connected = _state.IsPaused || _state.Pending ? 0 : members.Count(member => member.State == "connected" && !member.AwaitingConfirmation);
-        var awaitingConfirmation = _state.IsOwner && !_state.IsPaused && members.Any(member => member.AwaitingConfirmation);
+        var connected = _state.IsPaused || _state.Pending ? 0 : members.Count(member => member.State == "connected");
+        var syncPending = _state.IsOwner && !_state.IsPaused ? members.Count(member => member.AwaitingConfirmation) : 0;
+        var awaitingConfirmation = syncPending > 0 && members.Any(member => member.AwaitingConfirmation && member.State != "connected");
         SetupPanel.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
         NetworkPanel.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
         StateTitle.Text = _state.IsPaused ? "Сеть отключена на этом ПК"
@@ -377,7 +407,6 @@ public partial class NetworkWindow : Window
             : !active ? "Создайте сеть или присоединитесь"
             : _state.Pending ? "Ожидаем подписанный допуск"
             : connected > 0 ? $"Соединения работают · {connected} из {members.Count}"
-            : awaitingConfirmation ? "Передаём подтверждение участнику"
             : members.Count == 0 ? "Сеть создана · пригласите участников" : "Проверяем соединения";
         StateDot.Fill = _state.IsPaused ? Brushes.SlateGray : _state.State == "revoked" ? Brushes.Salmon
             : connected > 0 ? Brushes.MediumSpringGreen : active ? Brushes.Gold : Brushes.SlateGray;
@@ -387,11 +416,16 @@ public partial class NetworkWindow : Window
         LocalAddress.Text = active ? $"Мой виртуальный IP — {_state.LocalIP}    ·    {(_state.Masked ? "WireGuard с маскировкой UDP" : "WireGuard")}" : "";
         LocalAddressPanel.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
         CopyLocalIPButton.IsEnabled = active && !string.IsNullOrEmpty(_state.LocalIP);
+        RosterSyncStatus.Text = syncPending > 0
+            ? $"Обновление состава сети: ожидаем подтверждение от {syncPending} ПК. Проверка соединений выполняется отдельно."
+            : "";
+        RosterSyncStatus.Visibility = syncPending > 0 ? Visibility.Visible : Visibility.Collapsed;
         ConfirmationPanel.Visibility = !_state.IsPaused && (_state.Pending || awaitingConfirmation)
             ? Visibility.Visible : Visibility.Collapsed;
+        ConfirmationTitle.Text = _state.Pending ? "Подтверждение подключения" : "Резервное обновление состава";
         ConfirmationHint.Text = _state.Pending
             ? "DirectLAN ожидает подписанное подтверждение. Отправьте запрос владельцу, если ещё не отправили. После принятия запроса оставьте оба ПК включёнными. Если подтверждение не приходит, вставьте свежий код сети от владельца."
-            : "Участник уже принят владельцем. DirectLAN передаёт ему подписанный допуск. Если он продолжает ожидать, нажмите «Скопировать подтверждение» и отправьте код. На втором ПК нужно нажать «Вставить обновлённый код сети».";
+            : "Если второй ПК ждёт допуска, передайте код кнопкой «Скопировать подтверждение». Там нужно нажать «Вставить обновлённый код сети».";
         var helpMode = _state.IsPaused ? "paused" : _state.Pending ? "pending" : awaitingConfirmation ? "confirm" : _state.IsOwner && members.Count == 0 ? "invite-first" : _state.IsOwner ? "invite" : "update";
         if (_helpMode != helpMode)
         {
@@ -403,7 +437,7 @@ public partial class NetworkWindow : Window
             : _state.Pending ? "Как завершить подключение" : "Как обновить состав сети";
         Step.Text = _state.IsPaused ? "Нажмите «Подключить сеть», чтобы восстановить соединения с участниками."
             : awaitingConfirmation
-            ? "Подписанный допуск отправляется автоматически. Для ручной передачи используйте кнопку «Скопировать подтверждение»."
+            ? "Подписанный состав передаётся автоматически. Для ручной передачи используйте кнопку «Скопировать подтверждение». Получение новой версии состава и проверка связи — отдельные этапы."
             : _state.IsOwner
             ? "Скопируйте код сети и отправьте новому участнику. Когда он пришлёт код своего компьютера, нажмите «Добавить участника»."
             : _state.Pending
@@ -421,7 +455,7 @@ public partial class NetworkWindow : Window
         EmptyMembers.Text = _state.Pending ? "Компьютеры сети появятся после подтверждения владельца."
             : "Других компьютеров пока нет. Пригласите первого участника кодом сети.";
         UpdateLifecycle();
-        ShowLogButton.IsEnabled = _runPath is not null && File.Exists(Path.ChangeExtension(_runPath, ".log"));
+        ShowLogButton.IsEnabled = CopyLogButton.IsEnabled = _runPath is not null && File.Exists(Path.ChangeExtension(_runPath, ".log"));
         PopulateMembers();
         UpdateStatusAnimation();
     }
@@ -520,20 +554,35 @@ public partial class NetworkWindow : Window
         public string ID => member.ID;
         public string Name => string.IsNullOrWhiteSpace(member.Name) ? "Компьютер" : member.Name;
         public string IP => member.IP;
-        public bool Connected => !unavailable && !paused && !pending && !member.AwaitingConfirmation && member.State == "connected";
+        public bool Connected => !unavailable && !paused && !pending && member.State == "connected";
         public bool Checking => !unavailable && !paused && !pending && member.Checking;
-        public string StateText => unavailable ? "Нет данных" : paused || member.State == "offline" ? "Отключён" : pending ? "Ожидает допуска" : member.AwaitingConfirmation ? "Доставляем допуск" : Connected ? "Работает" : Checking ? "Проверяем…"
+        public string StateText => unavailable ? "Нет данных" : paused || member.State == "offline" ? "Отключён" : pending ? "Ожидает допуска" : Connected ? "Работает" : Checking ? "Проверяем…"
             : member.State is "pending" or "waiting" ? "Ожидает допуска" : member.LastProbe is not null ? "Нет ответа" : "Подключаемся";
-        public Brush StateBrush => unavailable || paused || member.State == "offline" ? Brushes.SlateGray : pending || member.AwaitingConfirmation ? Brushes.Gold : Connected ? Brushes.MediumSpringGreen
+        public Brush StateBrush => unavailable || paused || member.State == "offline" ? Brushes.SlateGray : pending ? Brushes.Gold : Connected ? Brushes.MediumSpringGreen
             : member.LastProbe is not null ? Brushes.Salmon : Brushes.Gold;
         public string PingText => Connected ? $"{member.RTT:F1} мс" : "—";
-        public string HealthText => unavailable ? "Служба не отвечает. Состояние соединения неизвестно."
-            : paused ? "Соединения отключены на этом ПК. Нажмите «Подключить сеть», чтобы продолжить."
-            : pending ? "Этот ПК ожидает подписанный допуск. Отправьте запрос владельцу. Если автоматическая доставка не проходит, вставьте свежий код сети от владельца."
-            : member.AwaitingConfirmation ? "Участник принят. Ожидаем получения им подписанного допуска. Для ручной передачи нажмите «Скопировать подтверждение»."
-            : !string.IsNullOrWhiteSpace(member.Detail) ? member.Detail
-            : member.LastProbe is { } probe
-                ? $"Последняя проверка в {probe.ToLocalTime():HH:mm:ss}" + (member.LastHandshake is { } handshake ? $" · Рукопожатие WireGuard в {handshake.ToLocalTime():HH:mm:ss}" : " · Рукопожатие пока не подтверждено") + (Checking ? " · Идёт новая проверка…" : "") + (string.IsNullOrWhiteSpace(member.ProbeError) ? "" : $" · {member.ProbeError}")
-                : Checking ? "Идёт первая проверка…" : "Проверка через туннель ещё не завершена.";
+        public Visibility RosterSyncVisibility => !unavailable && !paused && !pending && member.AwaitingConfirmation
+            ? Visibility.Visible : Visibility.Collapsed;
+        public string HealthText
+        {
+            get
+            {
+                if (unavailable) return "Служба не отвечает. Состояние соединения неизвестно.";
+                if (paused) return "Соединения отключены на этом ПК. Нажмите «Подключить сеть», чтобы продолжить.";
+                if (pending) return "Этот ПК ожидает подписанный допуск. Отправьте запрос владельцу. Если автоматическая доставка не проходит, вставьте свежий код сети от владельца.";
+                var details = new List<string>();
+                if (!string.IsNullOrWhiteSpace(member.Detail)) details.Add(member.Detail);
+                if (member.LastProbe is { } probe) details.Add($"Последняя проверка в {probe.ToLocalTime():HH:mm:ss}");
+                if (member.LastHandshake is { } handshake) details.Add($"Последнее рукопожатие WireGuard в {handshake.ToLocalTime():HH:mm:ss}");
+                else if (member.LastProbe is not null) details.Add("Рукопожатие пока не подтверждено");
+                if (!string.IsNullOrWhiteSpace(member.ProbeError)) details.Add(member.ProbeError);
+                if (Checking) details.Add("Идёт новая проверка…");
+                if (details.Count == 0) details.Add("Проверка через туннель ещё не завершена.");
+                if (member.AwaitingConfirmation) details.Add(Connected
+                    ? "Связь работает. Подтверждение последней версии состава ещё ожидается."
+                    : "Подтверждение последней версии состава ещё ожидается. Если второй ПК ждёт допуска, передайте ему свежий код сети.");
+                return string.Join(" · ", details);
+            }
+        }
     }
 }

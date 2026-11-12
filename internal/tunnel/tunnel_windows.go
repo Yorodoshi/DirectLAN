@@ -273,7 +273,7 @@ func (t *Tunnel) Start() error {
 	}
 	t.echo = echo
 	t.echoDone = make(chan struct{})
-	go serveEcho(echo, t.echoDone, func(ip net.IP) bool { _, ok := t.echoPeers.Load(ip.String()); return ok })
+	go serveEcho(echo, t.echoDone, func(ip net.IP) bool { _, ok := t.echoPeers.Load(ip.String()); return ok }, t.policy.recordEcho, t.policy.recordEchoReadError)
 	return nil
 }
 
@@ -361,41 +361,61 @@ func (t *Tunnel) Probe(peerID string) (ProbeResult, error) {
 	t.mu.Unlock()
 	before, err := t.Stats(peerID)
 	if err != nil {
-		return ProbeResult{}, err
+		return ProbeResult{}, fmt.Errorf("%w: stage=before_stats: %w", ErrProbeFailed, err)
 	}
 
 	conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: localIP}, &net.UDPAddr{IP: peerIP, Port: ProbePort})
 	if err != nil {
-		return ProbeResult{}, fmt.Errorf("open overlay probe: %w", err)
+		return ProbeResult{}, fmt.Errorf("%w: stage=open_socket: %w", ErrProbeFailed, err)
 	}
 	defer conn.Close()
 	if err := conn.SetDeadline(time.Now().Add(probeWait)); err != nil {
-		return ProbeResult{}, err
+		return ProbeResult{}, fmt.Errorf("%w: stage=deadline: %w", ErrProbeFailed, err)
 	}
 	request := make([]byte, len(probePrefix)+32)
 	copy(request, probePrefix)
 	if _, err := rand.Read(request[len(probePrefix):]); err != nil {
-		return ProbeResult{}, err
+		return ProbeResult{}, fmt.Errorf("%w: stage=nonce: %w", ErrProbeFailed, err)
 	}
 	started := time.Now()
 	if _, err := conn.Write(request); err != nil {
-		return ProbeResult{}, fmt.Errorf("send overlay probe: %w", err)
+		return ProbeResult{}, fmt.Errorf("%w: stage=send: %w", ErrProbeFailed, err)
 	}
 	buf := make([]byte, len(request)+1)
 	n, err := conn.Read(buf)
-	if err != nil || n != len(request) || !bytes.Equal(buf[:n], request) {
-		return ProbeResult{}, errors.Join(ErrProbeFailed, err)
+	if err != nil {
+		stage := "reply_read"
+		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+			stage = "reply_timeout"
+		}
+		return ProbeResult{}, fmt.Errorf("%w: stage=%s: %w", ErrProbeFailed, stage, err)
+	}
+	if n != len(request) || !bytes.Equal(buf[:n], request) {
+		return ProbeResult{}, fmt.Errorf("%w: stage=bad_reply received=%d expected=%d", ErrProbeFailed, n, len(request))
 	}
 	rtt := time.Since(started)
 	stats, err := t.Stats(peerID)
 	if err != nil {
+		return ProbeResult{}, fmt.Errorf("%w: stage=after_stats: %w", ErrProbeFailed, err)
+	}
+	if err := validateProbeStats(before, stats, time.Now()); err != nil {
 		return ProbeResult{}, err
 	}
-	if stats.LastHandshake.IsZero() || time.Since(stats.LastHandshake) > 3*time.Minute ||
-		stats.TxBytes <= before.TxBytes || stats.RxBytes <= before.RxBytes {
-		return ProbeResult{}, ErrProbeFailed
-	}
 	return ProbeResult{PeerID: peerID, RTT: rtt, LastHandshake: stats.LastHandshake, TxBytes: stats.TxBytes, RxBytes: stats.RxBytes}, nil
+}
+
+func validateProbeStats(before, stats PeerStats, now time.Time) error {
+	if stats.LastHandshake.IsZero() {
+		return fmt.Errorf("%w: stage=handshake_missing", ErrProbeFailed)
+	}
+	if age := now.Sub(stats.LastHandshake); age > 3*time.Minute {
+		return fmt.Errorf("%w: stage=stale_handshake age_seconds=%d", ErrProbeFailed, int64(age/time.Second))
+	}
+	if stats.TxBytes <= before.TxBytes || stats.RxBytes <= before.RxBytes {
+		return fmt.Errorf("%w: stage=no_stats_delta tx_before=%d tx_after=%d rx_before=%d rx_after=%d", ErrProbeFailed,
+			before.TxBytes, stats.TxBytes, before.RxBytes, stats.RxBytes)
+	}
+	return nil
 }
 
 func (t *Tunnel) installPeerLocked(p *peer) (result error) {
@@ -525,16 +545,43 @@ func (t *Tunnel) stopLocked() error {
 	return errors.Join(errs...)
 }
 
-func serveEcho(conn *net.UDPConn, done chan<- struct{}, allowed func(net.IP) bool) {
+func recoverableEchoReadError(err error) bool {
+	return errors.Is(err, windows.WSAEMSGSIZE) || errors.Is(err, windows.WSAECONNRESET) || errors.Is(err, windows.WSAENETRESET)
+}
+
+func serveEcho(conn *net.UDPConn, done chan<- struct{}, allowed func(net.IP) bool, observe func(net.IP, bool), observeReadError func(error)) {
 	defer close(done)
 	buf := make([]byte, len(probePrefix)+33)
+	var retryDelay time.Duration
 	for {
 		n, remote, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if observeReadError != nil {
+				observeReadError(err)
+			}
+			// Windows reports a truncated UDP datagram as WSAEMSGSIZE. A
+			// malformed packet or an ICMP reset must not stop the responder.
+			// Back off on repeated recoverable errors; permanent failures exit.
+			if recoverableEchoReadError(err) {
+				if retryDelay == 0 {
+					retryDelay = 10 * time.Millisecond
+				} else {
+					retryDelay = min(2*retryDelay, 100*time.Millisecond)
+				}
+				time.Sleep(retryDelay)
+				continue
+			}
 			return
 		}
+		retryDelay = 0
 		if n == len(probePrefix)+32 && allowed(remote.IP) && bytes.Equal(buf[:len(probePrefix)], []byte(probePrefix)) {
-			_, _ = conn.WriteToUDP(buf[:n], remote) // same-size reply, no amplification
+			written, err := conn.WriteToUDP(buf[:n], remote) // same-size reply, no amplification
+			if observe != nil {
+				observe(remote.IP, err == nil && written == n)
+			}
 		}
 	}
 }

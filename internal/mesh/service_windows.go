@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,10 @@ type memberStatus struct {
 	Checking             bool      `json:"checking"`
 	AwaitingConfirmation bool      `json:"awaiting_confirmation"`
 	ProbeError           string    `json:"probe_error,omitempty"`
+	Detail               string    `json:"detail,omitempty"`
+	ProbeStage           string    `json:"probe_stage,omitempty"`
+	TxBytes              uint64    `json:"tx_bytes"`
+	RxBytes              uint64    `json:"rx_bytes"`
 	misses               int
 }
 
@@ -70,6 +75,7 @@ type node struct {
 	detail               string
 	members              map[string]memberStatus
 	wake                 chan struct{}
+	controlWake          chan struct{}
 	assembly             rosterAssembly
 	confirmed            map[string]uint64
 	lastTransfer         map[string]time.Time
@@ -79,6 +85,7 @@ type node struct {
 	controlAttempts      int
 	lastOwnerControl     time.Time
 	controlOwnerEndpoint netip.AddrPort
+	controlSources       map[string]authenticatedEndpoint
 }
 
 func Run(ctx context.Context, identityPath, uiSID string) error {
@@ -87,11 +94,13 @@ func Run(ctx context.Context, identityPath, uiSID string) error {
 	if err != nil {
 		return err
 	}
-	n := &node{keys: keys, path: identityPath + ".mesh.json", wake: make(chan struct{}, 1)}
+	n := &node{keys: keys, path: identityPath + ".mesh.json", wake: make(chan struct{}, 1), controlWake: make(chan struct{}, 1)}
 	var restore sync.Once
 	loop, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() { defer close(done); n.monitor(loop) }()
+	controlDone := make(chan struct{})
+	go func() { defer close(controlDone); n.controlLoop(loop) }()
 	err = directpair.RunWithHandler(ctx, identityPath, uiSID, func(ctx context.Context, req localipc.Request) (any, *localipc.Error) {
 		restore.Do(func() {
 			n.mu.Lock()
@@ -110,6 +119,7 @@ func Run(ctx context.Context, identityPath, uiSID string) error {
 	}
 	n.mu.Unlock()
 	<-done
+	<-controlDone
 	return err
 }
 
@@ -318,13 +328,17 @@ func (n *node) replace(p profile, code Code) error {
 		n.discovery = ""
 	}
 	n.requestCheck()
-	log.Printf("mesh event=network_loaded revision=%d members=%d pending=%t paused=%t", code.Revision, len(code.Members), p.Pending, p.Paused)
+	log.Printf("mesh event=network_loaded revision=%d members=%d pending=%t paused=%t local_udp_port=%d physical_if4=%d physical_if6=%d", code.Revision, len(code.Members), p.Pending, p.Paused, p.Port, interfaces.IPv4, interfaces.IPv6)
 	return nil
 }
 
 func (n *node) requestCheck() {
 	select {
 	case n.wake <- struct{}{}:
+	default:
+	}
+	select {
+	case n.controlWake <- struct{}{}:
 	default:
 	}
 }
@@ -419,7 +433,12 @@ func (n *node) accept(text string, code Code) error {
 		if err != nil {
 			return err
 		}
-		if err = n.replace(p, next); err != nil {
+		if !found && n.wg != nil && !n.p.Paused {
+			err = n.addOwnerMemberLive(p, next, m)
+		} else {
+			err = n.replace(p, next)
+		}
+		if err != nil {
 			return err
 		}
 		log.Printf("mesh event=member_approved peer=%s revision=%d members=%d", shortID(memberID(m)), next.Revision, len(next.Members))
@@ -446,6 +465,11 @@ func (n *node) accept(text string, code Code) error {
 		return errors.New("владелец ещё не принял ваш запрос")
 	}
 	p.Pending, p.Code = false, strings.TrimSpace(text)
+	if n.p.Pending && n.wg != nil && bytes.Equal(n.roster.Members[0].WireGuard, code.Members[0].WireGuard) {
+		if self, ok := localMember(code, n.keys.IdentityPublic()); ok && self.IP == n.p.LocalIP {
+			return n.admitWithoutRestart(p, code, self)
+		}
+	}
 	if !n.p.Pending && n.wg != nil && sameAuthorizations(n.roster, code) {
 		return n.updateRosterMetadata(p, code)
 	}
@@ -563,21 +587,10 @@ func (n *node) handle(_ context.Context, req localipc.Request) (any, *localipc.E
 			return fail(errors.New("дождитесь поиска внешнего адреса"))
 		}
 		if n.owner() {
-			code := n.roster
-			code.Members = append([]Member(nil), code.Members...)
-			code.Members[0].Endpoints = append([]netip.AddrPort(nil), n.endpoints...)
-			code.Revision++
-			code, text, err := n.sign(code)
-			if err != nil {
+			if err := n.refreshControlRoster(); err != nil {
 				return fail(err)
 			}
-			p := n.p
-			p.Code = text
-			if err = n.save(p); err != nil {
-				return fail(err)
-			}
-			n.p, n.roster = p, code
-			return map[string]string{"code": text}, nil
+			return map[string]string{"code": n.p.Code}, nil
 		}
 		public, err := n.keys.WireGuardPublic()
 		if err != nil {
@@ -652,7 +665,7 @@ func (n *node) status() any {
 	var members []memberStatus
 	if n.p.Code != "" {
 		state = "waiting"
-		detail = "Добавляйте участников через запросы и обновлённый код владельца."
+		detail = "Добавляйте участников через запросы. Обновления состава передаются автоматически."
 		if n.p.Pending {
 			state, detail = "pending", "Передайте запрос владельцу. После принятия подписанный допуск придёт автоматически; обновлённый код можно вставить вручную."
 		}
@@ -709,21 +722,11 @@ func (n *node) monitor(ctx context.Context) {
 	var nextScan time.Time
 	var mapped netip.AddrPort
 	for {
-		n.mu.Lock()
-		current := n.wg
-		var control <-chan tunnel.ControlMessage
-		if current != nil {
-			control = current.ControlMessages()
-		}
-		n.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		case <-n.wake:
-		case message := <-control:
-			n.handleControl(current, message)
-			continue
 		}
 		n.mu.Lock()
 		wg, p, interfaces := n.wg, n.p, n.interfaces
@@ -741,8 +744,11 @@ func (n *node) monitor(ctx context.Context) {
 			mapped, nextScan = lease, time.Now().Add(interval)
 			n.mu.Lock()
 			if n.wg == wg {
+				changed := !n.scanned || !slices.Equal(n.endpoints, endpoints) || n.discovery != detail
 				n.endpoints, n.discovery, n.scanned = endpoints, detail, true
-				log.Printf("mesh event=discovery endpoints=%d router_mapping=%t", len(endpoints), lease.IsValid())
+				if changed {
+					log.Printf("mesh event=discovery endpoints=%d router_mapping=%t", len(endpoints), lease.IsValid())
+				}
 			}
 			n.mu.Unlock()
 		}
@@ -768,8 +774,11 @@ func (n *node) monitor(ctx context.Context) {
 			workers.Add(1)
 			go func(m Member) {
 				defer workers.Done()
+				beforeStats, _ := wg.Stats(memberID(m))
+				beforeDiagnostics, _ := wg.Diagnostics(memberID(m))
 				probe, err := wg.Probe(memberID(m))
 				stats, statsErr := wg.Stats(memberID(m))
+				diagnostics, _ := wg.Diagnostics(memberID(m))
 				n.mu.Lock()
 				defer n.mu.Unlock()
 				if n.wg != wg {
@@ -779,13 +788,14 @@ func (n *node) monitor(ctx context.Context) {
 				s.Checking, s.LastProbe = false, time.Now()
 				if statsErr == nil {
 					s.LastHandshake = stats.LastHandshake
+					s.TxBytes, s.RxBytes = stats.TxBytes, stats.RxBytes
 				}
 				if err == nil {
 					if s.State != "connected" {
 						log.Printf("mesh event=tunnel_connected peer=%s rtt_ms=%.1f", shortID(memberID(m)), float64(probe.RTT)/float64(time.Millisecond))
 					}
 					s.State, s.RTT, s.misses = "connected", float64(probe.RTT)/float64(time.Millisecond), 0
-					s.ProbeError = ""
+					s.ProbeError, s.ProbeStage, s.Detail = "", "ok", ""
 					ep, parse := netip.ParseAddrPort(stats.Endpoint)
 					if parse == nil && directpair.PublicEndpoint(ep) && n.p.Learned[memberID(m)] != ep {
 						p := n.p
@@ -798,13 +808,22 @@ func (n *node) monitor(ctx context.Context) {
 				} else {
 					s.State, s.RTT = "connecting", 0
 					s.misses++
-					s.ProbeError = "Нет ответа внутри туннеля; проверьте допуск и доступность UDP."
+					s.ProbeStage, s.Detail = describeProbeFailure(err, stats, beforeDiagnostics, diagnostics, s.LastProbe)
+					s.ProbeError = ""
 					if s.misses == 1 || s.misses == 3 || s.misses%12 == 0 {
-						log.Printf("mesh event=probe_failed peer=%s attempts=%d handshake=%t", shortID(memberID(m)), s.misses, !s.LastHandshake.IsZero())
+						age := int64(-1)
+						if !s.LastHandshake.IsZero() {
+							age = max(0, int64(time.Since(s.LastHandshake)/time.Second))
+						}
+						log.Printf("mesh event=probe_failed peer=%s attempts=%d stage=%s handshake_age_s=%d wg_tx=%d wg_rx=%d tx_delta=%d rx_delta=%d tun_out=%d tun_in=%d echo_requests=%d echo_replies=%d policy_out_drops=%d policy_in_drops=%d write_errors=%d", shortID(memberID(m)), s.misses, s.ProbeStage, age, stats.TxBytes, stats.RxBytes, counterDelta(beforeStats.TxBytes, stats.TxBytes), counterDelta(beforeStats.RxBytes, stats.RxBytes), counterDelta(beforeDiagnostics.OutboundPackets, diagnostics.OutboundPackets), counterDelta(beforeDiagnostics.InboundPackets, diagnostics.InboundPackets), counterDelta(beforeDiagnostics.EchoRequests, diagnostics.EchoRequests), counterDelta(beforeDiagnostics.EchoReplies, diagnostics.EchoReplies), counterDelta(beforeDiagnostics.OutboundDrops, diagnostics.OutboundDrops), counterDelta(beforeDiagnostics.InboundDrops, diagnostics.InboundDrops), counterDelta(beforeDiagnostics.WriteErrors, diagnostics.WriteErrors))
+						if diagnostics.WriteErrors > 0 {
+							log.Printf("mesh event=adapter_write_error peer=%s total=%d error=%q", shortID(memberID(m)), diagnostics.WriteErrors, diagnostics.LastWriteError)
+						}
+						if diagnostics.EchoReadErrors > 0 {
+							log.Printf("mesh event=echo_read_error total=%d error=%q", diagnostics.EchoReadErrors, diagnostics.LastEchoReadError)
+						}
 					}
-					if s.misses >= 3 && len(m.Endpoints) > 0 {
-						_ = wg.SetDirectEndpoint(memberID(m), m.Endpoints[(s.misses-3)%len(m.Endpoints)])
-					}
+					n.rotatePeerEndpoint(wg, m, s.misses)
 				}
 				n.members[memberID(m)] = s
 			}(member)

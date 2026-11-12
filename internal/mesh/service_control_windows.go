@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
+	"net"
 	"net/netip"
 	"slices"
+	"syscall"
 	"time"
 
 	"directlan/internal/directpair"
@@ -22,6 +24,7 @@ func (n *node) resetControl(challenge [16]byte, secret [32]byte) {
 	n.challenge, n.cookieSecret, n.ownerCookie = challenge, secret, [16]byte{}
 	n.controlAttempts, n.lastOwnerControl, n.controlOwnerEndpoint = 0, time.Time{}, netip.AddrPort{}
 	n.confirmed, n.lastTransfer = make(map[string]uint64), make(map[string]time.Time)
+	n.controlSources = make(map[string]authenticatedEndpoint)
 	n.assembly.reset()
 }
 
@@ -62,7 +65,9 @@ func (n *node) updateRosterMetadata(p profile, code Code) error {
 	for _, next := range code.Members {
 		for _, old := range n.roster.Members {
 			if bytes.Equal(old.Identity, next.Identity) && !slices.Equal(old.Endpoints, next.Endpoints) {
-				delete(p.Learned, memberID(next))
+				if !n.controlSources[memberID(next)].fresh(time.Now()) {
+					delete(p.Learned, memberID(next))
+				}
 				changed = append(changed, next)
 				break
 			}
@@ -77,10 +82,17 @@ func (n *node) updateRosterMetadata(p profile, code Code) error {
 			continue
 		}
 		ep := memberEndpoint(p, m)
+		if source := n.controlSources[memberID(m)]; source.fresh(time.Now()) {
+			ep = source.endpoint
+		}
 		if ep.IsValid() {
-			_ = n.wg.SetDirectEndpoint(memberID(m), ep)
+			if err := n.wg.SetDirectEndpoint(memberID(m), ep); err != nil {
+				n.logControlError(memberID(m), "metadata_endpoint", err)
+			}
 			if bytes.Equal(m.Identity, code.Owner) {
-				_ = n.wg.ConfigureControlPeer(memberID(m), m.WireGuard, ep)
+				if err := n.wg.ConfigureControlPeer(memberID(m), m.WireGuard, ep); err != nil {
+					n.logControlError(memberID(m), "metadata_control", err)
+				}
 			}
 		}
 	}
@@ -91,8 +103,8 @@ func (n *node) updateRosterMetadata(p profile, code Code) error {
 
 func (n *node) sendHello() {
 	n.mu.Lock()
+	defer n.mu.Unlock()
 	if n.wg == nil || n.p.Paused || n.owner() || len(n.roster.Members) == 0 {
-		n.mu.Unlock()
 		return
 	}
 	wg, owner := n.wg, n.roster.Members[0]
@@ -116,12 +128,19 @@ func (n *node) sendHello() {
 	if n.controlAttempts == 1 || n.controlAttempts%12 == 0 {
 		log.Printf("mesh event=admission_hello attempt=%d pending=%t endpoint_available=%t", n.controlAttempts, n.p.Pending, ep.IsValid())
 	}
-	n.mu.Unlock()
 	if !ep.IsValid() {
 		return
 	}
-	if err := wg.ConfigureControlPeer(memberID(owner), owner.WireGuard, ep); err == nil {
-		_ = wg.SendControl(memberID(owner), payload)
+	operation := "hello_configure"
+	err := wg.ConfigureControlPeer(memberID(owner), owner.WireGuard, ep)
+	if err == nil {
+		operation = "hello_send"
+		err = wg.SendControl(memberID(owner), payload)
+	}
+	if err != nil {
+		if n.wg == wg {
+			n.logControlError(memberID(owner), operation, err)
+		}
 	}
 }
 
@@ -136,6 +155,11 @@ func (n *node) handleControl(wg *tunnel.Tunnel, message tunnel.ControlMessage) {
 		n.mu.Unlock()
 		for _, packet := range packets {
 			if err := wg.SendControl(message.PeerID, packet); err != nil {
+				n.mu.Lock()
+				if n.wg == wg {
+					n.logControlError(message.PeerID, "reply_send", err)
+				}
+				n.mu.Unlock()
 				break
 			}
 		}
@@ -150,6 +174,13 @@ func (n *node) handleControl(wg *tunnel.Tunnel, message tunnel.ControlMessage) {
 		changed := !hmac.Equal(n.ownerCookie[:], body[:16]) || n.controlOwnerEndpoint != message.Endpoint
 		copy(n.ownerCookie[:], body[:16])
 		n.lastOwnerControl, n.controlOwnerEndpoint = time.Now(), message.Endpoint
+		n.rememberControlEndpoint(message.PeerID, message.Endpoint, time.Now())
+		if !n.p.Pending && changed {
+			if err := n.wg.SetDirectEndpoint(message.PeerID, message.Endpoint); err != nil {
+				n.logControlError(message.PeerID, "owner_endpoint", err)
+			}
+			n.learnControlEndpoint(message.PeerID, message.Endpoint)
+		}
 		if changed {
 			log.Printf("mesh event=admission_challenge_received pending=%t", n.p.Pending)
 		}
@@ -172,9 +203,13 @@ func (n *node) handleControl(wg *tunnel.Tunnel, message tunnel.ControlMessage) {
 	owner := n.roster.Members[0]
 	n.lastOwnerControl, n.controlOwnerEndpoint = time.Now(), message.Endpoint
 	if n.wg != nil {
-		_ = n.wg.ConfigureControlPeer(memberID(owner), owner.WireGuard, message.Endpoint)
+		if err := n.wg.ConfigureControlPeer(memberID(owner), owner.WireGuard, message.Endpoint); err != nil {
+			n.logControlError(memberID(owner), "roster_control", err)
+		}
 		if !n.p.Pending {
-			_ = n.wg.SetDirectEndpoint(memberID(owner), message.Endpoint)
+			if err := n.wg.SetDirectEndpoint(memberID(owner), message.Endpoint); err != nil {
+				n.logControlError(memberID(owner), "roster_endpoint", err)
+			}
 			n.learnControlEndpoint(memberID(owner), message.Endpoint)
 		}
 	}
@@ -184,6 +219,7 @@ func (n *node) handleControl(wg *tunnel.Tunnel, message tunnel.ControlMessage) {
 }
 
 func (n *node) learnControlEndpoint(id string, endpoint netip.AddrPort) {
+	n.rememberControlEndpoint(id, endpoint, time.Now())
 	if n.p.Learned[id] == endpoint {
 		return
 	}
@@ -195,6 +231,66 @@ func (n *node) learnControlEndpoint(id string, endpoint netip.AddrPort) {
 		return
 	}
 	n.p = p
+}
+
+func (n *node) rememberControlEndpoint(id string, endpoint netip.AddrPort, now time.Time) {
+	if !directpair.PublicEndpoint(endpoint) {
+		return
+	}
+	if n.controlSources == nil {
+		n.controlSources = make(map[string]authenticatedEndpoint)
+	}
+	n.controlSources[id] = authenticatedEndpoint{endpoint: endpoint, observed: now}
+}
+
+// Called under n.mu. A fresh authenticated control source is stronger evidence
+// than a failed overlay probe, which may be blocked separately by the host.
+func (n *node) rotatePeerEndpoint(wg *tunnel.Tunnel, m Member, misses int) {
+	if wg == nil || n.wg != wg {
+		return
+	}
+	id := memberID(m)
+	ep, rotate := peerEndpointCandidate(n.controlSources[id], n.p.Learned[id], m.Endpoints, misses, time.Now())
+	if !rotate {
+		return
+	}
+	if err := wg.SetDirectEndpoint(id, ep); err != nil {
+		n.logControlError(id, "rotate_endpoint", err)
+		return
+	}
+	if misses == 3 || misses%12 == 0 {
+		log.Printf("mesh event=endpoint_candidate_rotated misses=%d", misses)
+	}
+}
+
+// Raw network errors can contain public addresses. Keep logs bounded and emit
+// only the operation, error category and numeric OS status.
+func (n *node) logControlError(id, operation string, err error) {
+	if err == nil {
+		return
+	}
+	if n.lastTransfer == nil {
+		n.lastTransfer = make(map[string]time.Time)
+	}
+	key, now := id+"/error/"+operation, time.Now()
+	if previous := n.lastTransfer[key]; !previous.IsZero() && now.Sub(previous) < 30*time.Second {
+		return
+	}
+	n.lastTransfer[key] = now
+	reason := "transport_error"
+	var status syscall.Errno
+	var network net.Error
+	switch {
+	case errors.Is(err, tunnel.ErrNotStarted), errors.Is(err, tunnel.ErrStopped):
+		reason = "tunnel_stopped"
+	case errors.Is(err, tunnel.ErrUnknownPeer):
+		reason = "unknown_peer"
+	case errors.As(err, &network) && network.Timeout():
+		reason = "timeout"
+	case errors.As(err, &status):
+		reason = "os_error"
+	}
+	log.Printf("mesh event=control_failed operation=%s reason=%s os_code=%d", operation, reason, uint64(status))
 }
 
 func (n *node) applyControlRoster(text string, revision uint64) error {
@@ -239,6 +335,7 @@ func (n *node) ownerControl(message tunnel.ControlMessage) [][]byte {
 		}
 		n.lastTransfer[key] = now
 		if err := n.wg.ConfigureControlPeer(message.PeerID, guest.WireGuard, message.Endpoint); err != nil {
+			n.logControlError(message.PeerID, "challenge_configure", err)
 			return nil
 		}
 		packet := append(append([]byte(nil), nonce[:]...), expected[:]...)
@@ -248,9 +345,12 @@ func (n *node) ownerControl(message tunnel.ControlMessage) [][]byte {
 		return nil
 	}
 	if err := n.wg.ConfigureControlPeer(message.PeerID, guest.WireGuard, message.Endpoint); err != nil {
+		n.logControlError(message.PeerID, "ack_configure", err)
 		return nil
 	}
-	_ = n.wg.SetDirectEndpoint(message.PeerID, message.Endpoint)
+	if err := n.wg.SetDirectEndpoint(message.PeerID, message.Endpoint); err != nil {
+		n.logControlError(message.PeerID, "ack_endpoint", err)
+	}
 	n.learnControlEndpoint(message.PeerID, message.Endpoint)
 	previous := n.confirmed[message.PeerID]
 	n.confirmed[message.PeerID] = revision
