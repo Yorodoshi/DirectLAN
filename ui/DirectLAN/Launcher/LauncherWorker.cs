@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
 using System.Security.Principal;
+using System.Text;
 using System.Text.Json;
 using DirectLAN.Ipc;
 
@@ -50,7 +51,7 @@ public static class LauncherWorker
             }
             Process Start(string name, params string[] args)
             {
-                var info = new ProcessStartInfo(LaunchConfig.Executable(name)) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = LaunchConfig.Bundle, RedirectStandardError = true, RedirectStandardOutput = true };
+                var info = new ProcessStartInfo(LaunchConfig.Executable(name)) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = LaunchConfig.Bundle, RedirectStandardError = true, RedirectStandardOutput = true, StandardErrorEncoding = Encoding.UTF8, StandardOutputEncoding = Encoding.UTF8 };
                 foreach (var arg in args) info.ArgumentList.Add(arg);
                 var process = new Process { StartInfo = info };
                 process.ErrorDataReceived += (_, e) => Log(e.Data);

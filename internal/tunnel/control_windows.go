@@ -13,6 +13,7 @@ import (
 	"errors"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.zx2c4.com/wireguard/conn"
@@ -37,16 +38,17 @@ type ControlMessage struct {
 }
 
 type controlPeer struct {
-	id       string
-	public   [32]byte
-	send     cipher.AEAD
-	receive  cipher.AEAD
-	sendTag  [controlTagSize]byte
-	recvTag  [controlTagSize]byte
-	endpoint netip.AddrPort
-	seen     map[[chacha20poly1305.NonceSizeX]byte]bool
-	recent   [controlReplayWindow][chacha20poly1305.NonceSizeX]byte
-	next     int
+	id                     string
+	public                 [32]byte
+	send                   cipher.AEAD
+	receive                cipher.AEAD
+	sendTag                [controlTagSize]byte
+	recvTag                [controlTagSize]byte
+	endpoint               netip.AddrPort
+	seen                   map[[chacha20poly1305.NonceSizeX]byte]bool
+	recent                 [controlReplayWindow][chacha20poly1305.NonceSizeX]byte
+	next                   int
+	authIn, sent, rejected atomic.Uint64
 }
 
 type controlTransport struct {
@@ -186,10 +188,12 @@ func (c *controlTransport) receive(packet []byte, from conn.Endpoint) bool {
 		return false
 	}
 	if len(packet) <= controlHeaderSize+chacha20poly1305.Overhead || len(packet) > controlPacketLimit || from == nil {
+		p.rejected.Add(1)
 		return true
 	}
 	endpoint, err := netip.ParseAddrPort(from.DstToString())
 	if err != nil || endpoint.Port() == 0 || endpoint.Addr().IsUnspecified() {
+		p.rejected.Add(1)
 		return true
 	}
 	nonce := [chacha20poly1305.NonceSizeX]byte(packet[controlTagSize:controlHeaderSize])
@@ -197,20 +201,24 @@ func (c *controlTransport) receive(packet []byte, from conn.Endpoint) bool {
 	replayed := p.seen[nonce]
 	c.mu.RUnlock()
 	if replayed {
+		p.rejected.Add(1)
 		return true
 	}
 	payload, err := p.receive.Open(nil, packet[controlTagSize:controlHeaderSize], packet[controlHeaderSize:], packet[:controlTagSize])
 	if err != nil {
+		p.rejected.Add(1)
 		return true
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.peers[p.id] != p || p.seen[nonce] {
+		p.rejected.Add(1)
 		return true
 	}
 	delete(p.seen, p.recent[p.next])
 	p.recent[p.next], p.seen[nonce] = nonce, true
 	p.next = (p.next + 1) % len(p.recent)
+	p.authIn.Add(1)
 	select {
 	case c.messages <- ControlMessage{PeerID: p.id, Payload: payload, Endpoint: endpoint}:
 	default:
@@ -249,7 +257,16 @@ func (t *Tunnel) SendControl(id string, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	return bind.Bind.Send([][]byte{packet}, endpoint)
+	if err := bind.Bind.Send([][]byte{packet}, endpoint); err != nil {
+		return err
+	}
+	bind.transport.rawOut.Add(1)
+	control.mu.RLock()
+	if p := control.peers[id]; p != nil {
+		p.sent.Add(1)
+	}
+	control.mu.RUnlock()
+	return nil
 }
 
 func (t *Tunnel) ControlMessages() <-chan ControlMessage {

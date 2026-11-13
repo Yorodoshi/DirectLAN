@@ -92,8 +92,9 @@ func derivePeerCrypto(private, remote []byte, networkID string) (*peerCrypto, er
 }
 
 type maskPeer struct {
-	id   string
-	keys *peerCrypto
+	id          string
+	keys        *peerCrypto
+	diagnostics maskedCounters
 }
 
 type udpMask struct {

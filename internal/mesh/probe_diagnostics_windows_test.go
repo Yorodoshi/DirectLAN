@@ -44,3 +44,30 @@ func TestProbeDiagnosisSeparatesObservedStages(t *testing.T) {
 		t.Fatal("counter reset underflow")
 	}
 }
+
+func TestTransportDiagnosisUsesAuthenticatedPeerCountersOnly(t *testing.T) {
+	d := tunnel.TransportDiagnostics{PeerAttributed: true, InitiationIn: 4, ResponseOut: 4}
+	stage, _ := describeTransportFailure("reply_timeout", "original", tunnel.PeerStats{}, d)
+	if stage != "handshake_incomplete" {
+		t.Fatal(stage)
+	}
+	d.ResponseIn = 1
+	stage, _ = describeTransportFailure("reply_timeout", "original", tunnel.PeerStats{}, d)
+	if stage != "wireguard_response_unconfirmed" {
+		t.Fatal(stage)
+	}
+	d.PeerAttributed = false
+	stage, detail := describeTransportFailure("reply_timeout", "original", tunnel.PeerStats{}, d)
+	if stage != "reply_timeout" || detail != "original" {
+		t.Fatal("unattributed socket traffic blamed on peer")
+	}
+	d.PeerAttributed = true
+	stage, _ = describeTransportFailure("local_route", "original", tunnel.PeerStats{}, d)
+	if stage != "local_route" {
+		t.Fatal("strong local evidence was hidden")
+	}
+	stage, _ = describeTransportFailure("reply_timeout", "original", tunnel.PeerStats{LastHandshake: time.Now()}, d)
+	if stage != "reply_timeout" {
+		t.Fatal("completed handshake reported as rejected")
+	}
+}

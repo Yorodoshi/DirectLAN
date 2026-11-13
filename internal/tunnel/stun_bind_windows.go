@@ -23,6 +23,7 @@ type stunBind struct {
 	pending    map[[stun.TransactionIDSize]byte]stunQuery
 	mask       *udpMask
 	control    *controlTransport
+	transport  transportCounters
 }
 
 type stunQuery struct {
@@ -65,6 +66,7 @@ func (b *stunBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				return n, err
 			}
 			for i, size := range sizes[:n] {
+				b.transport.rawIn.Add(1)
 				packet := packets[i][:size]
 				if stun.IsMessage(packet) && packet[0] == 1 && packet[1] == 1 {
 					b.receiveSTUN(packet, endpoints[i])
@@ -74,11 +76,15 @@ func (b *stunBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				} else if b.mask != nil {
 					id, size, err := b.mask.open(packet)
 					if err != nil {
+						b.transport.rejected.Add(1)
 						sizes[i] = 0
 						continue
 					}
 					sizes[i] = size
+					b.mask.record(id, packet[:size], true)
 					endpoints[i] = &maskedEndpoint{Endpoint: endpoints[i], peerID: id}
+				} else {
+					b.transport.in.record(packet)
 				}
 			}
 			return n, nil
@@ -104,7 +110,14 @@ func (b *stunBind) ParseEndpoint(text string) (conn.Endpoint, error) {
 
 func (b *stunBind) Send(packets [][]byte, endpoint conn.Endpoint) error {
 	if b.mask == nil {
-		return b.Bind.Send(packets, endpoint)
+		if err := b.Bind.Send(packets, endpoint); err != nil {
+			return err
+		}
+		b.transport.rawOut.Add(uint64(len(packets)))
+		for _, packet := range packets {
+			b.transport.out.record(packet)
+		}
+		return nil
 	}
 	masked, ok := endpoint.(*maskedEndpoint)
 	if !ok {
@@ -118,6 +131,8 @@ func (b *stunBind) Send(packets [][]byte, endpoint conn.Endpoint) error {
 		if err := b.Bind.Send([][]byte{sealed}, masked.Endpoint); err != nil {
 			return err
 		}
+		b.transport.rawOut.Add(1)
+		b.mask.record(masked.peerID, packet, false)
 	}
 	return nil
 }
@@ -184,6 +199,7 @@ func (b *stunBind) discover(ctx context.Context, server netip.AddrPort) (netip.A
 		if err := b.Bind.Send([][]byte{message.Raw}, endpoint); err != nil {
 			return netip.AddrPort{}, err
 		}
+		b.transport.rawOut.Add(1)
 		select {
 		case result := <-query.result:
 			return result, nil

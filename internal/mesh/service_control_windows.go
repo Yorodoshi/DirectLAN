@@ -25,6 +25,7 @@ func (n *node) resetControl(challenge [16]byte, secret [32]byte) {
 	n.controlAttempts, n.lastOwnerControl, n.controlOwnerEndpoint = 0, time.Time{}, netip.AddrPort{}
 	n.confirmed, n.lastTransfer = make(map[string]uint64), make(map[string]time.Time)
 	n.controlSources = make(map[string]authenticatedEndpoint)
+	n.wireGuardSources = make(map[string]authenticatedEndpoint)
 	n.assembly.reset()
 }
 
@@ -65,7 +66,7 @@ func (n *node) updateRosterMetadata(p profile, code Code) error {
 	for _, next := range code.Members {
 		for _, old := range n.roster.Members {
 			if bytes.Equal(old.Identity, next.Identity) && !slices.Equal(old.Endpoints, next.Endpoints) {
-				if !n.controlSources[memberID(next)].fresh(time.Now()) {
+				if !n.authenticatedSource(memberID(next), time.Now()).fresh(time.Now()) {
 					delete(p.Learned, memberID(next))
 				}
 				changed = append(changed, next)
@@ -82,14 +83,14 @@ func (n *node) updateRosterMetadata(p profile, code Code) error {
 			continue
 		}
 		ep := memberEndpoint(p, m)
-		if source := n.controlSources[memberID(m)]; source.fresh(time.Now()) {
+		if source := n.authenticatedSource(memberID(m), time.Now()); source.fresh(time.Now()) {
 			ep = source.endpoint
 		}
 		if ep.IsValid() {
 			if err := n.wg.SetDirectEndpoint(memberID(m), ep); err != nil {
 				n.logControlError(memberID(m), "metadata_endpoint", err)
 			}
-			if bytes.Equal(m.Identity, code.Owner) {
+			if n.owner() || bytes.Equal(m.Identity, code.Owner) {
 				if err := n.wg.ConfigureControlPeer(memberID(m), m.WireGuard, ep); err != nil {
 					n.logControlError(memberID(m), "metadata_control", err)
 				}
@@ -250,7 +251,7 @@ func (n *node) rotatePeerEndpoint(wg *tunnel.Tunnel, m Member, misses int) {
 		return
 	}
 	id := memberID(m)
-	ep, rotate := peerEndpointCandidate(n.controlSources[id], n.p.Learned[id], m.Endpoints, misses, time.Now())
+	ep, rotate := peerEndpointCandidate(n.authenticatedSource(id, time.Now()), n.p.Learned[id], m.Endpoints, misses, time.Now())
 	if !rotate {
 		return
 	}

@@ -72,6 +72,7 @@ type node struct {
 	endpoints            []netip.AddrPort
 	scanned              bool
 	discovery            string
+	mappingAssessment    directpair.MappingAssessment
 	detail               string
 	members              map[string]memberStatus
 	wake                 chan struct{}
@@ -86,6 +87,7 @@ type node struct {
 	lastOwnerControl     time.Time
 	controlOwnerEndpoint netip.AddrPort
 	controlSources       map[string]authenticatedEndpoint
+	wireGuardSources     map[string]authenticatedEndpoint
 }
 
 func Run(ctx context.Context, identityPath, uiSID string) error {
@@ -324,11 +326,12 @@ func (n *node) replace(p profile, code Code) error {
 	n.members = make(map[string]memberStatus)
 	n.resetControl(challenge, secret)
 	n.endpoints, n.scanned, n.discovery, n.detail = nil, false, "Ищем внешний адрес…", ""
+	n.mappingAssessment = directpair.MappingAssessment{}
 	if wg == nil {
 		n.discovery = ""
 	}
 	n.requestCheck()
-	log.Printf("mesh event=network_loaded revision=%d members=%d pending=%t paused=%t local_udp_port=%d physical_if4=%d physical_if6=%d", code.Revision, len(code.Members), p.Pending, p.Paused, p.Port, interfaces.IPv4, interfaces.IPv6)
+	log.Printf("mesh event=network_loaded network=%s revision=%d members=%d pending=%t paused=%t local_udp_port=%d physical_if4=%d physical_if6=%d", shortID(code.Session), code.Revision, len(code.Members), p.Pending, p.Paused, p.Port, interfaces.IPv4, interfaces.IPv6)
 	return nil
 }
 
@@ -389,7 +392,7 @@ func (n *node) create(name string, masked bool, p profile) error {
 
 func (n *node) accept(text string, code Code) error {
 	if code.Session != n.roster.Session || code.Network != n.roster.Network || !bytes.Equal(code.Owner, n.roster.Owner) || code.Masked != n.roster.Masked {
-		return errors.New("код относится к другой сети или режиму защиты")
+		return errors.New("код относится к другой сети или режиму защиты. Для новой сети передайте другу новое приглашение и получите новый запрос")
 	}
 	p := n.p
 	p.Learned = cloneEndpoints(p.Learned)
@@ -426,7 +429,9 @@ func (n *node) accept(text string, code Code) error {
 			}
 			next.Members = append(next.Members, m)
 		}
-		delete(p.Learned, memberID(m))
+		if !found || !n.authenticatedSource(memberID(m), time.Now()).fresh(time.Now()) {
+			delete(p.Learned, memberID(m))
+		}
 		next.Revision++
 		var err error
 		next, p.Code, err = n.sign(next)
@@ -435,6 +440,8 @@ func (n *node) accept(text string, code Code) error {
 		}
 		if !found && n.wg != nil && !n.p.Paused {
 			err = n.addOwnerMemberLive(p, next, m)
+		} else if found && n.wg != nil && !n.p.Paused && sameAuthorizations(n.roster, next) {
+			err = n.updateRosterMetadata(p, next)
 		} else {
 			err = n.replace(p, next)
 		}
@@ -739,15 +746,16 @@ func (n *node) monitor(ctx context.Context) {
 		}
 		if time.Now().After(nextScan) {
 			scan, cancel := context.WithTimeout(ctx, 9*time.Second)
-			endpoints, detail, lease, interval := directpair.DiscoverEndpoints(scan, wg, p.Port, p.Router, p.DisableSTUN, p.Nonce, mapped, interfaces)
+			endpoints, detail, lease, interval, assessment := directpair.DiscoverEndpointsWithAssessment(scan, wg, p.Port, p.Router, p.DisableSTUN, p.Nonce, mapped, interfaces)
 			cancel()
 			mapped, nextScan = lease, time.Now().Add(interval)
 			n.mu.Lock()
 			if n.wg == wg {
-				changed := !n.scanned || !slices.Equal(n.endpoints, endpoints) || n.discovery != detail
+				changed := !n.scanned || !slices.Equal(n.endpoints, endpoints) || n.discovery != detail || n.mappingAssessment != assessment
 				n.endpoints, n.discovery, n.scanned = endpoints, detail, true
+				n.mappingAssessment = assessment
 				if changed {
-					log.Printf("mesh event=discovery endpoints=%d router_mapping=%t", len(endpoints), lease.IsValid())
+					log.Printf("mesh event=discovery endpoints=%d router_mapping=%t stun_samples=%d stun_distinct=%d observation=%s", len(endpoints), lease.IsValid(), assessment.Samples, assessment.Distinct, assessment.Result)
 				}
 			}
 			n.mu.Unlock()
@@ -779,6 +787,7 @@ func (n *node) monitor(ctx context.Context) {
 				probe, err := wg.Probe(memberID(m))
 				stats, statsErr := wg.Stats(memberID(m))
 				diagnostics, _ := wg.Diagnostics(memberID(m))
+				transport, _ := wg.TransportDiagnostics(memberID(m))
 				n.mu.Lock()
 				defer n.mu.Unlock()
 				if n.wg != wg {
@@ -787,6 +796,7 @@ func (n *node) monitor(ctx context.Context) {
 				s := n.members[memberID(m)]
 				s.Checking, s.LastProbe = false, time.Now()
 				if statsErr == nil {
+					n.learnWireGuardEndpoint(memberID(m), stats, s.RxBytes, s.LastProbe)
 					s.LastHandshake = stats.LastHandshake
 					s.TxBytes, s.RxBytes = stats.TxBytes, stats.RxBytes
 				}
@@ -809,6 +819,7 @@ func (n *node) monitor(ctx context.Context) {
 					s.State, s.RTT = "connecting", 0
 					s.misses++
 					s.ProbeStage, s.Detail = describeProbeFailure(err, stats, beforeDiagnostics, diagnostics, s.LastProbe)
+					s.ProbeStage, s.Detail = describeTransportFailure(s.ProbeStage, s.Detail, stats, transport)
 					s.ProbeError = ""
 					if s.misses == 1 || s.misses == 3 || s.misses%12 == 0 {
 						age := int64(-1)
@@ -816,6 +827,7 @@ func (n *node) monitor(ctx context.Context) {
 							age = max(0, int64(time.Since(s.LastHandshake)/time.Second))
 						}
 						log.Printf("mesh event=probe_failed peer=%s attempts=%d stage=%s handshake_age_s=%d wg_tx=%d wg_rx=%d tx_delta=%d rx_delta=%d tun_out=%d tun_in=%d echo_requests=%d echo_replies=%d policy_out_drops=%d policy_in_drops=%d write_errors=%d", shortID(memberID(m)), s.misses, s.ProbeStage, age, stats.TxBytes, stats.RxBytes, counterDelta(beforeStats.TxBytes, stats.TxBytes), counterDelta(beforeStats.RxBytes, stats.RxBytes), counterDelta(beforeDiagnostics.OutboundPackets, diagnostics.OutboundPackets), counterDelta(beforeDiagnostics.InboundPackets, diagnostics.InboundPackets), counterDelta(beforeDiagnostics.EchoRequests, diagnostics.EchoRequests), counterDelta(beforeDiagnostics.EchoReplies, diagnostics.EchoReplies), counterDelta(beforeDiagnostics.OutboundDrops, diagnostics.OutboundDrops), counterDelta(beforeDiagnostics.InboundDrops, diagnostics.InboundDrops), counterDelta(beforeDiagnostics.WriteErrors, diagnostics.WriteErrors))
+						log.Printf("mesh event=transport_counters peer=%s udp_in_all=%d udp_out_all=%d mask_rejected_all=%d wire_peer_scoped=%t mask_in=%d mask_out=%d init_in=%d init_out=%d response_in=%d response_out=%d data_in=%d data_out=%d control_in=%d control_out=%d control_rejected=%d", shortID(memberID(m)), transport.NativeUDPIn, transport.NativeUDPOut, transport.MaskRejected, transport.PeerAttributed, transport.MaskAuthenticatedIn, transport.MaskAuthenticatedOut, transport.InitiationIn, transport.InitiationOut, transport.ResponseIn, transport.ResponseOut, transport.DataIn, transport.DataOut, transport.ControlAuthenticatedIn, transport.ControlSent, transport.ControlRejected)
 						if diagnostics.WriteErrors > 0 {
 							log.Printf("mesh event=adapter_write_error peer=%s total=%d error=%q", shortID(memberID(m)), diagnostics.WriteErrors, diagnostics.LastWriteError)
 						}

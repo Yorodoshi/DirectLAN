@@ -127,6 +127,10 @@ func DiscoverEndpoints(ctx context.Context, wg *tunnel.Tunnel, port uint16, rout
 	return discover(ctx, wg, profile{Port: port, Router: router, DisableSTUN: disableSTUN, MappingNonce: nonce}, previous, interfaces)
 }
 
+func DiscoverEndpointsWithAssessment(ctx context.Context, wg *tunnel.Tunnel, port uint16, router, disableSTUN bool, nonce [12]byte, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration, MappingAssessment) {
+	return discoverReport(ctx, wg, profile{Port: port, Router: router, DisableSTUN: disableSTUN, MappingNonce: nonce}, previous, interfaces)
+}
+
 func (n *node) restore() error {
 	data, err := os.ReadFile(n.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -549,7 +553,13 @@ func (n *node) monitor(ctx context.Context) {
 }
 
 func discover(ctx context.Context, wg *tunnel.Tunnel, p profile, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration) {
+	endpoints, detail, mapped, interval, _ := discoverReport(ctx, wg, p, previous, interfaces)
+	return endpoints, detail, mapped, interval
+}
+
+func discoverReport(ctx context.Context, wg *tunnel.Tunnel, p profile, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration, MappingAssessment) {
 	interval := 35 * time.Second
+	assessment := MappingAssessment{Result: "not_tested"}
 	var endpoints []netip.AddrPort
 	add := func(ep netip.AddrPort) {
 		if !PublicEndpoint(ep) || len(endpoints) >= 4 {
@@ -611,49 +621,45 @@ func discover(ctx context.Context, wg *tunnel.Tunnel, p profile, previous netip.
 	if len(endpoints) > 0 {
 		detail = fmt.Sprintf("Найдено адресов: %d. Доступность проверяется при подключении второго ПК.", len(endpoints))
 	}
-	if len(endpoints) == 0 && !p.DisableSTUN {
+	if !p.DisableSTUN {
 		stunCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		observed := discoverSTUN(stunCtx, wg)
+		observed, report := discoverSTUNReport(stunCtx, wg)
 		cancel()
-		add(observed)
-		if len(endpoints) > 0 {
-			detail = "STUN нашёл внешний UDP-адрес. Доступность проверяется при подключении второго ПК."
+		assessment = report
+		if len(observed) > 0 {
+			// Retain both sampled mappings even when a physical interface has
+			// many public addresses. Codes remain limited to four candidates.
+			known := endpoints
+			endpoints = nil
+			// An explicit router lease remains the first candidate; STUN can
+			// observe a different mapping while contacting its own destination.
+			add(mapped)
+			for _, endpoint := range observed {
+				add(endpoint)
+			}
+			for _, endpoint := range known {
+				add(endpoint)
+			}
+			if len(known) == 0 {
+				detail = "STUN нашёл внешний UDP-адрес. Доступность проверяется при подключении второго ПК."
+			} else {
+				detail = fmt.Sprintf("Найдено адресов: %d. Доступность проверяется при подключении второго ПК.", len(endpoints))
+			}
 			interval = min(interval, 15*time.Second)
 		} else {
 			detail += " Ответа от STUN нет."
 		}
+		if assessment.Result == "different_observations" {
+			detail += " Внешний UDP-адрес или порт меняется между STUN-серверами; это может мешать прямому соединению."
+		}
 	}
-	return endpoints, detail, mapped, interval
+	return endpoints, detail, mapped, interval, assessment
 }
 
 func discoverSTUN(ctx context.Context, wg *tunnel.Tunnel) netip.AddrPort {
-	providers := [...]struct {
-		host string
-		port uint16
-	}{
-		{"stun.cloudflare.com", 3478},
-		{"stun.l.google.com", 19302},
-	}
-	for _, provider := range providers {
-		attempt, cancel := context.WithTimeout(ctx, 1800*time.Millisecond)
-		ips, err := net.DefaultResolver.LookupNetIP(attempt, "ip4", provider.host)
-		var observed netip.AddrPort
-		if err == nil {
-			for _, ip := range ips {
-				server := netip.AddrPortFrom(ip.Unmap(), provider.port)
-				if PublicEndpoint(server) {
-					observed, err = wg.DiscoverDirectEndpoint(attempt, server)
-					break
-				}
-			}
-		}
-		cancel()
-		if err == nil && PublicEndpoint(observed) {
-			return observed
-		}
-		if ctx.Err() != nil {
-			break
-		}
+	observed, _ := discoverSTUNReport(ctx, wg)
+	if len(observed) != 0 {
+		return observed[0]
 	}
 	return netip.AddrPort{}
 }

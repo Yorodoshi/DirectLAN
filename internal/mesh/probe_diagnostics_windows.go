@@ -16,6 +16,19 @@ func counterDelta(before, after uint64) uint64 {
 	return after - before
 }
 
+func describeTransportFailure(stage, detail string, stats tunnel.PeerStats, d tunnel.TransportDiagnostics) (string, string) {
+	if stage != "reply_timeout" || !stats.LastHandshake.IsZero() || !d.PeerAttributed {
+		return stage, detail
+	}
+	if d.ResponseIn > 0 {
+		return "wireguard_response_unconfirmed", "Ответ рукопожатия дошёл и прошёл проверку шифрованной оболочки, но завершение сеанса WireGuard не подтверждено. Обновите коды существующей сети на обоих ПК."
+	}
+	if d.InitiationIn > 0 && d.ResponseOut > 0 {
+		return "handshake_incomplete", "Принимаем запросы рукопожатия и отправляем ответы, но завершение не подтверждено. Нужно проверить приём ответа на втором ПК и обратный UDP-путь."
+	}
+	return stage, detail
+}
+
 func describeProbeFailure(err error, stats tunnel.PeerStats, before, after tunnel.PeerDiagnostics, now time.Time) (string, string) {
 	stage := "unknown"
 	if err != nil {

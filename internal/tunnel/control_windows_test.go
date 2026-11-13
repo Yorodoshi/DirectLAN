@@ -222,6 +222,9 @@ func TestControlAuthenticationDomainsReplayAndBounds(t *testing.T) {
 	if !mb.receive(packet, replaySource) || len(mb.messages) != 0 || kb.endpoint != got.Endpoint {
 		t.Fatal("recent replay was not rejected")
 	}
+	if kb.authIn.Load() != 1 || kb.rejected.Load() == 0 {
+		t.Fatal("control diagnostics counted rejected messages as authenticated or lost rejection evidence")
+	}
 	for _, payload := range [][]byte{nil, make([]byte, ControlPayloadLimit+1)} {
 		if _, _, err := ma.seal("b", payload); err == nil {
 			t.Fatal("invalid outbound control size accepted")
