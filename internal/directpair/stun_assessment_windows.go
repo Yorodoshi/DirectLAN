@@ -7,9 +7,12 @@ import (
 	"net"
 	"net/netip"
 	"time"
-
-	"directlan/internal/tunnel"
 )
+
+// EndpointDiscoverer queries STUN on the transport's existing UDP socket.
+type EndpointDiscoverer interface {
+	DiscoverDirectEndpoint(context.Context, netip.AddrPort) (netip.AddrPort, error)
+}
 
 // MappingAssessment reports only successful public STUN observations. Matching
 // samples do not prove reachability; timeouts do not establish a NAT type.
@@ -19,7 +22,7 @@ type MappingAssessment struct {
 	Result   string `json:"result"`
 }
 
-func discoverSTUNReport(ctx context.Context, wg *tunnel.Tunnel) ([]netip.AddrPort, MappingAssessment) {
+func discoverSTUNReport(ctx context.Context, wg EndpointDiscoverer) ([]netip.AddrPort, MappingAssessment) {
 	return sampleSTUNMappings(ctx, net.DefaultResolver.LookupNetIP, wg.DiscoverDirectEndpoint)
 }
 

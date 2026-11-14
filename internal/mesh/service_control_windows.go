@@ -20,10 +20,27 @@ import (
 
 func shortID(id string) string { return id[:min(8, len(id))] }
 
+// A recipient nonce is usable for pushes only after its source-bound cookie
+// proved this return path. Entries never outlive their signed member/key.
+type controlGuest struct {
+	nonce     [16]byte
+	public    [32]byte
+	endpoint  netip.AddrPort
+	validated time.Time
+	revision  uint64
+}
+
+func (guest controlGuest) fresh(now time.Time) bool {
+	return directpair.PublicEndpoint(guest.endpoint) && !guest.validated.IsZero() &&
+		!now.Before(guest.validated) && now.Sub(guest.validated) < authenticatedEndpointTTL
+}
+
 func (n *node) resetControl(challenge [16]byte, secret [32]byte) {
 	n.challenge, n.cookieSecret, n.ownerCookie = challenge, secret, [16]byte{}
 	n.controlAttempts, n.lastOwnerControl, n.controlOwnerEndpoint = 0, time.Time{}, netip.AddrPort{}
+	n.lastControlHello = time.Time{}
 	n.confirmed, n.lastTransfer = make(map[string]uint64), make(map[string]time.Time)
+	n.controlGuests = make(map[string]controlGuest)
 	n.controlSources = make(map[string]authenticatedEndpoint)
 	n.wireGuardSources = make(map[string]authenticatedEndpoint)
 	n.assembly.reset()
@@ -102,14 +119,21 @@ func (n *node) updateRosterMetadata(p profile, code Code) error {
 	return nil
 }
 
-func (n *node) sendHello() {
+func (n *node) sendHello() { n.sendHelloAt(time.Now(), false) }
+
+func (n *node) sendHelloNow() { n.sendHelloAt(time.Now(), true) }
+
+func (n *node) sendHelloAt(now time.Time, immediate bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.wg == nil || n.p.Paused || n.owner() || len(n.roster.Members) == 0 {
 		return
 	}
+	if !immediate && !n.lastControlHello.IsZero() && !now.Before(n.lastControlHello) && now.Sub(n.lastControlHello) < 5*time.Second {
+		return
+	}
+	n.lastControlHello = now
 	wg, owner := n.wg, n.roster.Members[0]
-	now := time.Now()
 	if !n.lastOwnerControl.IsZero() && now.Sub(n.lastOwnerControl) > 15*time.Second {
 		n.controlOwnerEndpoint, n.ownerCookie = netip.AddrPort{}, [16]byte{}
 	}
@@ -145,7 +169,7 @@ func (n *node) sendHello() {
 	}
 }
 
-func (n *node) handleControl(wg *tunnel.Tunnel, message tunnel.ControlMessage) {
+func (n *node) handleControl(wg meshTunnel, message tunnel.ControlMessage) {
 	n.mu.Lock()
 	if wg == nil || n.wg != wg || n.p.Paused || !directpair.PublicEndpoint(message.Endpoint) {
 		n.mu.Unlock()
@@ -153,17 +177,8 @@ func (n *node) handleControl(wg *tunnel.Tunnel, message tunnel.ControlMessage) {
 	}
 	if n.owner() {
 		packets := n.ownerControl(message)
+		n.sendControlPackets(wg, message.PeerID, packets)
 		n.mu.Unlock()
-		for _, packet := range packets {
-			if err := wg.SendControl(message.PeerID, packet); err != nil {
-				n.mu.Lock()
-				if n.wg == wg {
-					n.logControlError(message.PeerID, "reply_send", err)
-				}
-				n.mu.Unlock()
-				break
-			}
-		}
 		return
 	}
 	if message.PeerID != hex.EncodeToString(n.roster.Owner) || len(message.Payload) < 17 || !hmac.Equal(message.Payload[:16], n.challenge[:]) {
@@ -187,7 +202,7 @@ func (n *node) handleControl(wg *tunnel.Tunnel, message tunnel.ControlMessage) {
 		}
 		n.mu.Unlock()
 		if changed {
-			n.sendHello()
+			n.sendHelloNow()
 		}
 		return
 	}
@@ -216,7 +231,7 @@ func (n *node) handleControl(wg *tunnel.Tunnel, message tunnel.ControlMessage) {
 	}
 	log.Printf("mesh event=admission_received revision=%d pending=%t", n.roster.Revision, n.p.Pending)
 	n.mu.Unlock()
-	n.sendHello()
+	n.sendHelloNow()
 }
 
 func (n *node) learnControlEndpoint(id string, endpoint netip.AddrPort) {
@@ -246,7 +261,7 @@ func (n *node) rememberControlEndpoint(id string, endpoint netip.AddrPort, now t
 
 // Called under n.mu. A fresh authenticated control source is stronger evidence
 // than a failed overlay probe, which may be blocked separately by the host.
-func (n *node) rotatePeerEndpoint(wg *tunnel.Tunnel, m Member, misses int) {
+func (n *node) rotatePeerEndpoint(wg meshTunnel, m Member, misses int) {
 	if wg == nil || n.wg != wg {
 		return
 	}
@@ -307,6 +322,151 @@ func (n *node) applyControlRoster(text string, revision uint64) error {
 	return n.accept(text, code)
 }
 
+// Called under n.mu. Only the owner may publish this extra candidate. An
+// endpoint observed by the owner may be destination-dependent under NAT; keep
+// the member's other signed candidates rather than calling it a global route.
+func (n *node) publishGuestEndpoint(id string, endpoint, previous netip.AddrPort) error {
+	if !n.owner() || !directpair.PublicEndpoint(endpoint) {
+		return nil
+	}
+	code := n.roster
+	for index, member := range code.Members {
+		if index == 0 || memberID(member) != id {
+			continue
+		}
+		if slices.Contains(member.Endpoints, endpoint) {
+			return nil
+		}
+		candidates := []netip.AddrPort{endpoint}
+		for _, candidate := range member.Endpoints {
+			// Replace a known superseded observation first when all four
+			// slots are occupied; otherwise retain useful alternate routes.
+			if len(member.Endpoints) >= 4 && candidate == previous {
+				continue
+			}
+			if len(candidates) < 4 {
+				candidates = append(candidates, candidate)
+			}
+		}
+		code.Members = append([]Member(nil), code.Members...)
+		code.Members[index].Endpoints = candidates
+		code.Revision++
+		code, text, err := n.sign(code)
+		if err != nil {
+			return err
+		}
+		p := n.p
+		p.Code = text
+		if err := n.save(p); err != nil {
+			return err
+		}
+		n.p, n.roster = p, code
+		n.requestCheck()
+		log.Printf("mesh event=peer_endpoint_published peer=%s revision=%d candidates=%d", shortID(id), code.Revision, len(candidates))
+		return nil
+	}
+	return nil
+}
+
+// mesh.sync calls this while holding n.mu. A manual retry does not reset the
+// tunnel, source-bound cookies, or the admission request a guest already sent.
+func (n *node) syncControlRoster() error {
+	if n.wg == nil || n.p.Paused {
+		return tunnel.ErrNotStarted
+	}
+	if n.owner() {
+		if err := n.refreshControlRoster(); err != nil {
+			return err
+		}
+		for id, guest := range n.controlGuests {
+			guest.revision = 0
+			n.controlGuests[id] = guest
+			delete(n.lastTransfer, id)
+		}
+	}
+	n.lastControlHello = time.Time{}
+	n.controlAttempts = 0
+	n.requestCheck()
+	return nil
+}
+
+func (n *node) driveOwnerControl() { n.driveOwnerControlAt(time.Now()) }
+
+// Exposed to the package's deterministic service harness: retries use this
+// supplied time, without sleeps or changes to the host's network.
+func (n *node) driveOwnerControlAt(now time.Time) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.wg == nil || n.p.Paused || !n.owner() {
+		return
+	}
+	if err := n.refreshControlRoster(); err != nil {
+		log.Printf("mesh event=roster_refresh_failed")
+		return
+	}
+	for id, guest := range n.controlGuests {
+		valid := false
+		for _, member := range n.roster.Members[1:] {
+			if memberID(member) == id && bytes.Equal(member.WireGuard, guest.public[:]) {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			delete(n.controlGuests, id)
+		}
+	}
+	for _, member := range n.roster.Members[1:] {
+		id := memberID(member)
+		guest, ok := n.controlGuests[id]
+		if !ok || guest.revision >= n.roster.Revision {
+			continue
+		}
+		n.sendControlPackets(n.wg, id, n.ownerRosterPackets(id, guest, now))
+	}
+}
+
+// Called under n.mu. Configure+send stay serialized so a small challenge to an
+// unproven source cannot redirect a simultaneous large roster transfer.
+func (n *node) sendControlPackets(wg meshTunnel, id string, packets [][]byte) {
+	for _, packet := range packets {
+		if err := wg.SendControl(id, packet); err != nil {
+			if n.wg == wg {
+				n.logControlError(id, "reply_send", err)
+			}
+			return
+		}
+	}
+}
+
+func (n *node) ownerRosterPackets(id string, guest controlGuest, now time.Time) [][]byte {
+	if !guest.fresh(now) || guest.revision >= n.roster.Revision {
+		return nil
+	}
+	if n.lastTransfer == nil {
+		n.lastTransfer = make(map[string]time.Time)
+	}
+	if previous := n.lastTransfer[id]; !previous.IsZero() && !now.Before(previous) && now.Sub(previous) < 2*time.Second {
+		return nil
+	}
+	parts, err := rosterPackets(n.p.Code, n.roster.Revision)
+	if err != nil {
+		return nil
+	}
+	// Always restore the proven address: a later hello with an invalid cookie
+	// may have used another source for its small challenge response.
+	if err := n.wg.ConfigureControlPeer(id, guest.public[:], guest.endpoint); err != nil {
+		n.logControlError(id, "push_configure", err)
+		return nil
+	}
+	n.lastTransfer[id] = now
+	for i := range parts {
+		parts[i] = append(append([]byte(nil), guest.nonce[:]...), parts[i]...)
+	}
+	log.Printf("mesh event=admission_sent peer=%s revision=%d fragments=%d push=true", shortID(id), n.roster.Revision, len(parts))
+	return parts
+}
+
 // Called under n.mu. A valid owner signature remains mandatory at the guest;
 // this cookie only limits reflection and establishes the current return path.
 func (n *node) ownerControl(message tunnel.ControlMessage) [][]byte {
@@ -325,6 +485,9 @@ func (n *node) ownerControl(message tunnel.ControlMessage) [][]byte {
 		return nil
 	}
 	now := time.Now()
+	if n.lastTransfer == nil {
+		n.lastTransfer = make(map[string]time.Time)
+	}
 	expected := admissionCookie(n.cookieSecret, message.PeerID, message.Endpoint, nonce)
 	if !hmac.Equal(cookie[:], expected[:]) {
 		key := message.PeerID + "/challenge"
@@ -345,6 +508,13 @@ func (n *node) ownerControl(message tunnel.ControlMessage) [][]byte {
 	if revision > n.roster.Revision {
 		return nil
 	}
+	if n.controlGuests == nil {
+		n.controlGuests = make(map[string]controlGuest)
+	}
+	previousSource := n.controlGuests[message.PeerID].endpoint
+	validated := controlGuest{nonce: nonce, endpoint: message.Endpoint, validated: now, revision: revision}
+	copy(validated.public[:], guest.WireGuard)
+	n.controlGuests[message.PeerID] = validated
 	if err := n.wg.ConfigureControlPeer(message.PeerID, guest.WireGuard, message.Endpoint); err != nil {
 		n.logControlError(message.PeerID, "ack_configure", err)
 		return nil
@@ -353,6 +523,9 @@ func (n *node) ownerControl(message tunnel.ControlMessage) [][]byte {
 		n.logControlError(message.PeerID, "ack_endpoint", err)
 	}
 	n.learnControlEndpoint(message.PeerID, message.Endpoint)
+	if n.confirmed == nil {
+		n.confirmed = make(map[string]uint64)
+	}
 	previous := n.confirmed[message.PeerID]
 	n.confirmed[message.PeerID] = revision
 	if revision > previous {
@@ -362,23 +535,14 @@ func (n *node) ownerControl(message tunnel.ControlMessage) [][]byte {
 		log.Printf("mesh event=roster_refresh_failed")
 		return nil
 	}
+	if err := n.publishGuestEndpoint(message.PeerID, message.Endpoint, previousSource); err != nil {
+		log.Printf("mesh event=peer_endpoint_publish_failed peer=%s", shortID(message.PeerID))
+	}
 	if revision == n.roster.Revision {
 		// A small authenticated response keeps the guest on the observed owner
 		// address and confirms liveness without repeatedly transferring the roster.
 		packet := append(append([]byte(nil), nonce[:]...), expected[:]...)
 		return [][]byte{append(packet, controlCookieKind)}
 	}
-	if now.Sub(n.lastTransfer[message.PeerID]) < 2*time.Second {
-		return nil
-	}
-	parts, err := rosterPackets(n.p.Code, n.roster.Revision)
-	if err != nil {
-		return nil
-	}
-	n.lastTransfer[message.PeerID] = now
-	for i := range parts {
-		parts[i] = append(append([]byte(nil), nonce[:]...), parts[i]...)
-	}
-	log.Printf("mesh event=admission_sent peer=%s revision=%d fragments=%d", shortID(message.PeerID), n.roster.Revision, len(parts))
-	return parts
+	return n.ownerRosterPackets(message.PeerID, validated, now)
 }

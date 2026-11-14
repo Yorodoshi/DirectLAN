@@ -30,5 +30,9 @@ func (n *node) controlLoop(ctx context.Context) {
 		case message := <-messages:
 			n.handleControl(wg, message)
 		}
+		// Discovery and the OS probe may wait for seconds on another worker.
+		// Keep hello cadence and owner roster retries independent of them.
+		n.sendHello()
+		n.driveOwnerControl()
 	}
 }

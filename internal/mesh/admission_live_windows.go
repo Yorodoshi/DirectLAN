@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/netip"
 	"time"
+
+	"directlan/internal/tunnel"
 )
 
 var errAdmissionRollback = errors.New("admission rollback failed")
@@ -62,6 +64,16 @@ func (n *node) admitWithoutRestart(p profile, code Code, self Member) error {
 	if !bytes.Equal(public, self.WireGuard) {
 		return errors.New("ключ этого ПК не совпадает с допуском в сеть")
 	}
+	readdressed := self.IP != n.p.LocalIP
+	if readdressed {
+		if err := n.wg.ReaddressPending(self.IP.AsSlice()); err != nil {
+			if errors.Is(err, tunnel.ErrStopped) {
+				n.wg = nil
+			}
+			return err
+		}
+		p.LocalIP = self.IP
+	}
 	previous := n.p
 	ownerID := memberID(code.Members[0])
 	if source := n.controlSources[ownerID]; source.fresh(time.Now()) {
@@ -72,6 +84,11 @@ func (n *node) admitWithoutRestart(p profile, code Code, self Member) error {
 	}
 	err = installAdmission(n.wg, previous, n.roster, code, self, func() error { return n.save(p) })
 	if err != nil {
+		if readdressed && !errors.Is(err, errAdmissionRollback) {
+			if rollback := n.wg.ReaddressPending(previous.LocalIP.AsSlice()); rollback != nil {
+				err = errors.Join(err, errAdmissionRollback, rollback)
+			}
+		}
 		if errors.Is(err, errAdmissionRollback) {
 			_ = n.wg.Stop()
 			n.wg = nil

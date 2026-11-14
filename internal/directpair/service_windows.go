@@ -123,11 +123,11 @@ func PhysicalInterfaces() (tunnel.DirectInterfaces, string) {
 	return physicalInterfaces()
 }
 
-func DiscoverEndpoints(ctx context.Context, wg *tunnel.Tunnel, port uint16, router, disableSTUN bool, nonce [12]byte, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration) {
+func DiscoverEndpoints(ctx context.Context, wg EndpointDiscoverer, port uint16, router, disableSTUN bool, nonce [12]byte, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration) {
 	return discover(ctx, wg, profile{Port: port, Router: router, DisableSTUN: disableSTUN, MappingNonce: nonce}, previous, interfaces)
 }
 
-func DiscoverEndpointsWithAssessment(ctx context.Context, wg *tunnel.Tunnel, port uint16, router, disableSTUN bool, nonce [12]byte, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration, MappingAssessment) {
+func DiscoverEndpointsWithAssessment(ctx context.Context, wg EndpointDiscoverer, port uint16, router, disableSTUN bool, nonce [12]byte, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration, MappingAssessment) {
 	return discoverReport(ctx, wg, profile{Port: port, Router: router, DisableSTUN: disableSTUN, MappingNonce: nonce}, previous, interfaces)
 }
 
@@ -552,12 +552,12 @@ func (n *node) monitor(ctx context.Context) {
 	}
 }
 
-func discover(ctx context.Context, wg *tunnel.Tunnel, p profile, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration) {
+func discover(ctx context.Context, wg EndpointDiscoverer, p profile, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration) {
 	endpoints, detail, mapped, interval, _ := discoverReport(ctx, wg, p, previous, interfaces)
 	return endpoints, detail, mapped, interval
 }
 
-func discoverReport(ctx context.Context, wg *tunnel.Tunnel, p profile, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration, MappingAssessment) {
+func discoverReport(ctx context.Context, wg EndpointDiscoverer, p profile, previous netip.AddrPort, interfaces tunnel.DirectInterfaces) ([]netip.AddrPort, string, netip.AddrPort, time.Duration, MappingAssessment) {
 	interval := 35 * time.Second
 	assessment := MappingAssessment{Result: "not_tested"}
 	var endpoints []netip.AddrPort
@@ -656,7 +656,7 @@ func discoverReport(ctx context.Context, wg *tunnel.Tunnel, p profile, previous 
 	return endpoints, detail, mapped, interval, assessment
 }
 
-func discoverSTUN(ctx context.Context, wg *tunnel.Tunnel) netip.AddrPort {
+func discoverSTUN(ctx context.Context, wg EndpointDiscoverer) netip.AddrPort {
 	observed, _ := discoverSTUNReport(ctx, wg)
 	if len(observed) != 0 {
 		return observed[0]

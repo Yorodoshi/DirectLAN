@@ -122,7 +122,7 @@ func TestPausedStatusNeverReportsCachedConnections(t *testing.T) {
 	keys, code, text := lifecycleNetwork(t)
 	for _, runtime := range []struct {
 		name string
-		wg   *tunnel.Tunnel
+		wg   meshTunnel
 	}{{"stopped", nil}, {"stale runtime", &tunnel.Tunnel{}}} {
 		t.Run(runtime.name, func(t *testing.T) {
 			remote := code.Members[1]

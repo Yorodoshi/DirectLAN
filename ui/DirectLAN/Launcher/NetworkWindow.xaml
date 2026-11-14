@@ -74,7 +74,10 @@
       </Border>
       <Image Source="/DirectLAN;component/Assets/DirectLANMark.png" Width="52" Height="52" Stretch="Uniform" Margin="0,0,14,0" DockPanel.Dock="Left" AutomationProperties.Name="DirectLAN"/>
       <StackPanel>
-        <TextBlock Text="DirectLAN" FontSize="29" FontWeight="Bold"/>
+        <StackPanel Orientation="Horizontal">
+          <TextBlock Text="DirectLAN" FontSize="29" FontWeight="Bold"/>
+          <TextBlock x:Name="AppVersionLabel" FontSize="12" Foreground="#9CB3CC" Margin="12,0,0,5" VerticalAlignment="Bottom"/>
+        </StackPanel>
         <TextBlock Text="Общая виртуальная сеть · прямые соединения" Foreground="#9CB3CC" Margin="0,4,0,0"/>
       </StackPanel>
     </DockPanel>
@@ -150,6 +153,7 @@
           <WrapPanel>
             <Button x:Name="CopyCodeButton" Content="Скопировать код сети" Click="CopyCode" Background="{StaticResource PrimaryActionBrush}" Foreground="White"/>
             <Button x:Name="ImportButton" Content="Вставить код участника" Click="ImportCode"/>
+            <Button x:Name="SyncRosterButton" Content="Обновить состав сети" Click="SyncRoster"/>
             <Button x:Name="CheckAllButton" Content="Проверить всех" Click="CheckAll"/>
           </WrapPanel>
           <TextBlock x:Name="RosterSyncStatus" Foreground="#D4BA88" Margin="0,0,0,10" Visibility="Collapsed"/>

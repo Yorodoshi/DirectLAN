@@ -66,7 +66,7 @@ type node struct {
 	path                 string
 	p                    profile
 	roster               Code
-	wg                   *tunnel.Tunnel
+	wg                   meshTunnel
 	interfaces           tunnel.DirectInterfaces
 	egress               string
 	endpoints            []netip.AddrPort
@@ -80,11 +80,13 @@ type node struct {
 	assembly             rosterAssembly
 	confirmed            map[string]uint64
 	lastTransfer         map[string]time.Time
+	controlGuests        map[string]controlGuest
 	challenge            [16]byte
 	ownerCookie          [16]byte
 	cookieSecret         [32]byte
 	controlAttempts      int
 	lastOwnerControl     time.Time
+	lastControlHello     time.Time
 	controlOwnerEndpoint netip.AddrPort
 	controlSources       map[string]authenticatedEndpoint
 	wireGuardSources     map[string]authenticatedEndpoint
@@ -186,7 +188,7 @@ func freeAddress(code Code) (netip.Addr, error) {
 	return netip.Addr{}, errors.New("в сети уже 10 компьютеров")
 }
 
-func (n *node) open(p profile, code Code) (*tunnel.Tunnel, uint16, tunnel.DirectInterfaces, string, error) {
+func (n *node) open(p profile, code Code) (meshTunnel, uint16, tunnel.DirectInterfaces, string, error) {
 	interfaces, egress := directpair.PhysicalInterfaces()
 	self, admitted := localMember(code, n.keys.IdentityPublic())
 	if admitted {
@@ -473,12 +475,17 @@ func (n *node) accept(text string, code Code) error {
 	}
 	p.Pending, p.Code = false, strings.TrimSpace(text)
 	if n.p.Pending && n.wg != nil && bytes.Equal(n.roster.Members[0].WireGuard, code.Members[0].WireGuard) {
-		if self, ok := localMember(code, n.keys.IdentityPublic()); ok && self.IP == n.p.LocalIP {
+		if self, ok := localMember(code, n.keys.IdentityPublic()); ok {
 			return n.admitWithoutRestart(p, code, self)
 		}
 	}
 	if !n.p.Pending && n.wg != nil && sameAuthorizations(n.roster, code) {
 		return n.updateRosterMetadata(p, code)
+	}
+	if !n.p.Pending && n.wg != nil {
+		if self, ok := localMember(code, n.keys.IdentityPublic()); ok && self.IP == n.p.LocalIP {
+			return n.updateRosterWithoutRestart(p, code, self)
+		}
 	}
 	// Fresh owner-approved endpoints supersede older learned addresses.
 	p.Learned = nil
@@ -521,6 +528,13 @@ func (n *node) handle(_ context.Context, req localipc.Request) (any, *localipc.E
 	switch req.Method {
 	case "mesh.status":
 		return n.status(), nil
+	case "mesh.sync":
+		if n.wg == nil || n.p.Paused {
+			return fail(errors.New("сначала подключитесь к сети"))
+		}
+		if err := n.syncControlRoster(); err != nil {
+			return fail(err)
+		}
 	case "mesh.disconnect", "mesh.resume", "mesh.restart":
 		if n.p.Code == "" {
 			return fail(errors.New("сначала создайте сеть или присоединитесь к ней"))
@@ -642,7 +656,13 @@ func (n *node) handle(_ context.Context, req localipc.Request) (any, *localipc.E
 		if err != nil {
 			return fail(err)
 		}
-		if err = n.replace(p, next); err != nil {
+		self, _ := localMember(next, n.keys.IdentityPublic())
+		if n.wg != nil && !n.p.Paused {
+			err = n.updateRosterWithoutRestart(p, next, self)
+		} else {
+			err = n.replace(p, next)
+		}
+		if err != nil {
 			return fail(err)
 		}
 	case "mesh.reset":
@@ -670,6 +690,25 @@ func (n *node) handle(_ context.Context, req localipc.Request) (any, *localipc.E
 func (n *node) status() any {
 	state, detail := "idle", n.detail
 	var members []memberStatus
+	rosterConfirmed, rosterTotal := 0, 0
+	if n.p.Code != "" {
+		if n.owner() {
+			for _, m := range n.roster.Members {
+				if bytes.Equal(m.Identity, n.keys.IdentityPublic()) {
+					continue
+				}
+				rosterTotal++
+				if n.confirmed[memberID(m)] >= n.roster.Revision {
+					rosterConfirmed++
+				}
+			}
+		} else {
+			rosterTotal = 1
+			if _, admitted := localMember(n.roster, n.keys.IdentityPublic()); admitted && !n.p.Pending {
+				rosterConfirmed = 1
+			}
+		}
+	}
 	if n.p.Code != "" {
 		state = "waiting"
 		detail = "Добавляйте участников через запросы. Обновления состава передаются автоматически."
@@ -708,24 +747,27 @@ func (n *node) status() any {
 		}
 	}
 	return struct {
-		State     string         `json:"state"`
-		Detail    string         `json:"detail"`
-		LocalIP   string         `json:"local_ip"`
-		Egress    string         `json:"egress"`
-		Discovery string         `json:"discovery"`
-		CodeReady bool           `json:"code_ready"`
-		IsOwner   bool           `json:"is_owner"`
-		Pending   bool           `json:"pending"`
-		Paused    bool           `json:"paused"`
-		Masked    bool           `json:"masked"`
-		Members   []memberStatus `json:"members"`
-	}{state, detail, n.p.LocalIP.String(), n.egress, n.discovery, n.scanned && n.wg != nil && !n.p.Paused, n.owner(), n.p.Pending, n.p.Paused, n.roster.Masked, members}
+		State           string         `json:"state"`
+		Detail          string         `json:"detail"`
+		LocalIP         string         `json:"local_ip"`
+		Egress          string         `json:"egress"`
+		Discovery       string         `json:"discovery"`
+		CodeReady       bool           `json:"code_ready"`
+		IsOwner         bool           `json:"is_owner"`
+		Pending         bool           `json:"pending"`
+		Paused          bool           `json:"paused"`
+		Masked          bool           `json:"masked"`
+		Members         []memberStatus `json:"members"`
+		RosterRevision  uint64         `json:"roster_revision"`
+		RosterConfirmed int            `json:"roster_confirmed"`
+		RosterTotal     int            `json:"roster_total"`
+	}{state, detail, n.p.LocalIP.String(), n.egress, n.discovery, n.scanned && n.wg != nil && !n.p.Paused, n.owner(), n.p.Pending, n.p.Paused, n.roster.Masked, members, n.roster.Revision, rosterConfirmed, rosterTotal}
 }
 
 func (n *node) monitor(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	var last *tunnel.Tunnel
+	var last meshTunnel
 	var nextScan time.Time
 	var mapped netip.AddrPort
 	for {
@@ -791,6 +833,10 @@ func (n *node) monitor(ctx context.Context) {
 				n.mu.Lock()
 				defer n.mu.Unlock()
 				if n.wg != wg {
+					return
+				}
+				current, authorized := localMember(n.roster, m.Identity)
+				if !authorized || !sameMemberAuthorization(current, m) {
 					return
 				}
 				s := n.members[memberID(m)]

@@ -30,10 +30,13 @@ public partial class NetworkWindow : Window
     private int _actionSequence;
     private string? _helpMode;
     private bool _statusPulseActive;
+    private static string AppVersion => typeof(NetworkWindow).Assembly.GetName().Version?.ToString(3) ?? "неизвестна";
 
     public NetworkWindow()
     {
         InitializeComponent();
+        AppVersionLabel.Text = $"v{AppVersion}";
+        Title = $"DirectLAN {AppVersion} · общая сеть";
         DeviceName.Text = Environment.MachineName;
         _poll.Tick += async (_, _) => await RefreshAsync();
         Closing += CloseAsync;
@@ -195,6 +198,16 @@ public partial class NetworkWindow : Window
     }
 
     private async void CheckAll(object sender, RoutedEventArgs e) => await CheckAsync("");
+
+    private async void SyncRoster(object sender, RoutedEventArgs e) => await RunAsync(async () =>
+    {
+        var isOwner = _state.IsOwner;
+        Apply(await _api.CallAsync("mesh.sync"));
+        SetNotice(isOwner
+            ? "Повторная передача подписанного состава запрошена. Подтверждения участников обновятся автоматически. Связь и пинг проверяются отдельно."
+            : "Обновление состава запрошено у владельца. Оставьте DirectLAN открытым на этом ПК и у владельца.");
+    });
+
     private async void CheckSelected(object sender, RoutedEventArgs e)
     {
         if (MembersGrid.SelectedItem is MemberRow member) await CheckAsync(member.ID);
@@ -284,8 +297,7 @@ public partial class NetworkWindow : Window
             if (lines.Count == 120) lines.Dequeue();
             lines.Enqueue(line);
         }
-        var version = typeof(NetworkWindow).Assembly.GetName().Version?.ToString(3) ?? "неизвестна";
-        return $"DirectLAN {version}{Environment.NewLine}Скопировано: {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC{Environment.NewLine}{Environment.NewLine}"
+        return $"DirectLAN {AppVersion}{Environment.NewLine}Скопировано: {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC{Environment.NewLine}{Environment.NewLine}"
             + string.Join(Environment.NewLine, lines);
     }
 
@@ -359,7 +371,7 @@ public partial class NetworkWindow : Window
         StateDot.Fill = Brushes.SlateGray;
         Detail.Text = "Не удалось обновить состояние соединений.";
         PopulateMembers(unavailable: true);
-        CopyCodeButton.IsEnabled = ImportButton.IsEnabled = CheckAllButton.IsEnabled = false;
+        CopyCodeButton.IsEnabled = ImportButton.IsEnabled = SyncRosterButton.IsEnabled = CheckAllButton.IsEnabled = false;
         _hasSavedNetwork = HasSavedNetwork() || _hasSavedNetwork;
         UpdateLifecycle();
         UpdateStatusAnimation();
@@ -416,10 +428,18 @@ public partial class NetworkWindow : Window
         LocalAddress.Text = active ? $"Мой виртуальный IP — {_state.LocalIP}    ·    {(_state.Masked ? "WireGuard с маскировкой UDP" : "WireGuard")}" : "";
         LocalAddressPanel.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
         CopyLocalIPButton.IsEnabled = active && !string.IsNullOrEmpty(_state.LocalIP);
-        RosterSyncStatus.Text = syncPending > 0
-            ? $"Обновление состава сети: ожидаем подтверждение от {syncPending} ПК. Проверка соединений выполняется отдельно."
-            : "";
-        RosterSyncStatus.Visibility = syncPending > 0 ? Visibility.Visible : Visibility.Collapsed;
+        RosterSyncStatus.Text = _state.RosterRevision > 0
+            ? _state.IsOwner
+                ? $"Состав сети · версия {_state.RosterRevision} · " + (_state.RosterTotal == 0
+                    ? "других участников пока нет."
+                    : $"подтвердили {_state.RosterConfirmed} из {_state.RosterTotal} ПК.")
+                : $"Состав сети · версия {_state.RosterRevision} · " + (_state.RosterConfirmed > 0
+                    ? "подписанный допуск этого ПК принят."
+                    : _state.Pending ? "ожидается подписанный допуск этого ПК." : "подписанный допуск этого ПК не установлен.")
+            : syncPending > 0 ? $"Обновление состава сети: ожидаем подтверждение от {syncPending} ПК." : "";
+        RosterSyncStatus.Foreground = _state.Pending || syncPending > 0
+            ? new SolidColorBrush(Color.FromRgb(212, 186, 136)) : new SolidColorBrush(Color.FromRgb(171, 193, 217));
+        RosterSyncStatus.Visibility = active && !string.IsNullOrEmpty(RosterSyncStatus.Text) ? Visibility.Visible : Visibility.Collapsed;
         ConfirmationPanel.Visibility = !_state.IsPaused && (_state.Pending || awaitingConfirmation)
             ? Visibility.Visible : Visibility.Collapsed;
         ConfirmationTitle.Text = _state.Pending ? "Подтверждение подключения" : "Резервное обновление состава";
@@ -445,6 +465,10 @@ public partial class NetworkWindow : Window
                 : "DirectLAN получает обновления состава сети от владельца. Свежий подписанный код можно также вставить вручную.";
         CopyCodeButton.Content = awaitingConfirmation ? "Скопировать подтверждение" : _state.IsOwner ? "Скопировать код сети" : _state.Pending ? "Скопировать запрос владельцу" : "Скопировать мой код";
         CopyCodeButton.IsEnabled = _state.CodeReady && !_state.IsPaused;
+        SyncRosterButton.IsEnabled = active && !_state.IsPaused && _state.State is not ("revoked" or "stopped");
+        SyncRosterButton.ToolTip = _state.IsOwner
+            ? "Повторно передать последнюю подписанную версию состава участникам."
+            : "Запросить у владельца свежий подписанный состав сети.";
         ImportButton.Content = _state.IsOwner ? "Добавить участника" : "Вставить обновлённый код сети";
         ImportButton.IsEnabled = true;
         CheckAllButton.IsEnabled = !_state.Pending && !_state.IsPaused && members.Count > 0 && members.Any(member => !member.Checking);
@@ -530,6 +554,9 @@ public partial class NetworkWindow : Window
         [JsonPropertyName("pending")] public bool Pending { get; set; }
         [JsonPropertyName("masked")] public bool Masked { get; set; }
         [JsonPropertyName("paused")] public bool Paused { get; set; }
+        [JsonPropertyName("roster_revision")] public ulong RosterRevision { get; set; }
+        [JsonPropertyName("roster_confirmed")] public int RosterConfirmed { get; set; }
+        [JsonPropertyName("roster_total")] public int RosterTotal { get; set; }
         [JsonIgnore] public bool IsPaused => Paused || State == "paused";
         [JsonPropertyName("members")] public List<MemberState> Members { get; set; } = [];
     }
