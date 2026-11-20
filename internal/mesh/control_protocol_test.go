@@ -25,8 +25,10 @@ func TestEndpointFallbackPreservesFreshAuthenticatedSource(t *testing.T) {
 	}{
 		{2, netip.AddrPort{}, false},
 		{3, learned, true},
-		{4, signed, true},
-		{5, learned, true},
+		{4, netip.AddrPort{}, false},
+		{5, netip.AddrPort{}, false},
+		{6, signed, true},
+		{9, learned, true},
 	} {
 		got, rotate := peerEndpointCandidate(source, learned, []netip.AddrPort{learned, {}, signed, signed}, check.misses, now)
 		if got != check.want || rotate != check.rotate {

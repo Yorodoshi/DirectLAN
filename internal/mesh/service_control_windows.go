@@ -53,12 +53,13 @@ func (n *node) refreshControlRoster() error {
 		return nil
 	}
 	code := n.roster
-	changed := n.scanned && !slices.Equal(code.Members[0].Endpoints, n.endpoints)
+	hasEndpoints := n.scanned && len(n.endpoints) > 0
+	changed := hasEndpoints && !slices.Equal(code.Members[0].Endpoints, n.endpoints)
 	if !changed && time.Until(code.Expires) > 5*time.Minute {
 		return nil
 	}
 	code.Members = append([]Member(nil), code.Members...)
-	if n.scanned {
+	if hasEndpoints {
 		code.Members[0].Endpoints = append([]netip.AddrPort(nil), n.endpoints...)
 	}
 	code.Revision++
@@ -261,13 +262,14 @@ func (n *node) rememberControlEndpoint(id string, endpoint netip.AddrPort, now t
 
 // Called under n.mu. A fresh authenticated control source is stronger evidence
 // than a failed overlay probe, which may be blocked separately by the host.
-func (n *node) rotatePeerEndpoint(wg meshTunnel, m Member, misses int) {
+func (n *node) rotatePeerEndpoint(wg meshTunnel, m Member, misses int, currentEndpoint string) {
 	if wg == nil || n.wg != wg {
 		return
 	}
 	id := memberID(m)
 	ep, rotate := peerEndpointCandidate(n.authenticatedSource(id, time.Now()), n.p.Learned[id], m.Endpoints, misses, time.Now())
-	if !rotate {
+	current, _ := netip.ParseAddrPort(currentEndpoint)
+	if !rotate || ep == current {
 		return
 	}
 	if err := wg.SetDirectEndpoint(id, ep); err != nil {

@@ -22,14 +22,14 @@ func (source authenticatedEndpoint) fresh(now time.Time) bool {
 // A failed application probe does not invalidate a recently authenticated UDP
 // path. Once that evidence expires, try learned and signed addresses in order.
 func peerEndpointCandidate(source authenticatedEndpoint, learned netip.AddrPort, signed []netip.AddrPort, misses int, now time.Time) (netip.AddrPort, bool) {
-	if misses < 3 || source.fresh(now) {
+	if misses < 3 || misses%3 != 0 || source.fresh(now) {
 		return netip.AddrPort{}, false
 	}
 	candidates := controlCandidates(learned, signed)
 	if len(candidates) == 0 {
 		return netip.AddrPort{}, false
 	}
-	return candidates[(misses-3)%len(candidates)], true
+	return candidates[(misses/3-1)%len(candidates)], true
 }
 
 func sameAuthorizations(a, b Code) bool {

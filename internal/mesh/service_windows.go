@@ -881,7 +881,7 @@ func (n *node) monitor(ctx context.Context) {
 							log.Printf("mesh event=echo_read_error total=%d error=%q", diagnostics.EchoReadErrors, diagnostics.LastEchoReadError)
 						}
 					}
-					n.rotatePeerEndpoint(wg, m, s.misses)
+					n.rotatePeerEndpoint(wg, current, s.misses, stats.Endpoint)
 				}
 				n.members[memberID(m)] = s
 			}(member)
