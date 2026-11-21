@@ -208,6 +208,13 @@ public partial class NetworkWindow : Window
             : "Обновление состава запрошено у владельца. Оставьте DirectLAN открытым на этом ПК и у владельца.");
     });
 
+    private async void CheckPath(object sender, RoutedEventArgs e)
+    {
+        if (MembersGrid.SelectedItem is MemberRow member)
+            await RunAsync(async () => Apply(await _api.CallAsync("mesh.path", new { id = member.ID })));
+    }
+
+    private string _pathResult = "";
     private async void CheckSelected(object sender, RoutedEventArgs e)
     {
         if (MembersGrid.SelectedItem is MemberRow member) await CheckAsync(member.ID);
@@ -405,6 +412,11 @@ public partial class NetworkWindow : Window
     {
         _state = response.ValueKind == JsonValueKind.Object ? response.Deserialize<NetworkState>() ?? new() : new();
         _state.Members ??= [];
+        if (response.TryGetProperty("path_result", out var path) && path.GetString() is string result && result != _pathResult)
+        {
+            _pathResult = result;
+            if (result.Length > 0) SetNotice(result);
+        }
         _serviceUnavailable = false;
         var active = _state.State != "idle" || _state.Pending || _state.IsOwner;
         _hasSavedNetwork = active;
@@ -516,6 +528,7 @@ public partial class NetworkWindow : Window
     {
         var selected = MembersGrid.SelectedItem as MemberRow;
         CopyIPButton.IsEnabled = !_serviceUnavailable && selected?.Connected == true;
+        PathButton.IsEnabled = !_serviceUnavailable && !_state.IsPaused && selected is not null;
         CheckSelectedButton.IsEnabled = !_serviceUnavailable && !_state.Pending && !_state.IsPaused && selected is { Checking: false };
         RemoveButton.IsEnabled = !_serviceUnavailable && _state.IsOwner && selected is not null;
         SelectedHealth.Text = selected?.HealthText ?? "Выберите участника, чтобы проверить связь с ним.";

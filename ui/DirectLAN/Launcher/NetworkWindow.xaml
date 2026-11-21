@@ -194,6 +194,7 @@
           <TextBlock x:Name="SelectedHealth" Foreground="#ABC1D9" Margin="0,0,0,9"/>
           <WrapPanel>
             <Button x:Name="CopyIPButton" Content="Скопировать IP" Click="CopyIP" IsEnabled="False"/>
+            <Button x:Name="PathButton" Content="Проверить адаптер" Click="CheckPath" ToolTip="30 секунд. Журнал покажет внешний IPv4 и UDP-порт участника."/>
             <Button x:Name="CheckSelectedButton" Content="Проверить участника" Click="CheckSelected" IsEnabled="False"/>
             <Button x:Name="RemoveButton" Content="Удалить участника" Click="RemoveMember" IsEnabled="False"/>
           </WrapPanel>

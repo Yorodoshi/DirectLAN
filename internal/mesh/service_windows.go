@@ -61,6 +61,8 @@ type memberStatus struct {
 }
 
 type node struct {
+	pathBusy             bool
+	pathResult           string
 	mu                   sync.Mutex
 	keys                 identity.State
 	path                 string
@@ -528,6 +530,10 @@ func (n *node) handle(_ context.Context, req localipc.Request) (any, *localipc.E
 	switch req.Method {
 	case "mesh.status":
 		return n.status(), nil
+	case "mesh.path":
+		if err := n.startPathCheck(args.ID); err != nil {
+			return fail(err)
+		}
 	case "mesh.sync":
 		if n.wg == nil || n.p.Paused {
 			return fail(errors.New("сначала подключитесь к сети"))
@@ -760,8 +766,9 @@ func (n *node) status() any {
 		Members         []memberStatus `json:"members"`
 		RosterRevision  uint64         `json:"roster_revision"`
 		RosterConfirmed int            `json:"roster_confirmed"`
+		PathResult      string         `json:"path_result"`
 		RosterTotal     int            `json:"roster_total"`
-	}{state, detail, n.p.LocalIP.String(), n.egress, n.discovery, n.scanned && n.wg != nil && !n.p.Paused, n.owner(), n.p.Pending, n.p.Paused, n.roster.Masked, members, n.roster.Revision, rosterConfirmed, rosterTotal}
+	}{state, detail, n.p.LocalIP.String(), n.egress, n.discovery, n.scanned && n.wg != nil && !n.p.Paused, n.owner(), n.p.Pending, n.p.Paused, n.roster.Masked, members, n.roster.Revision, rosterConfirmed, n.pathResult, rosterTotal}
 }
 
 func (n *node) monitor(ctx context.Context) {
